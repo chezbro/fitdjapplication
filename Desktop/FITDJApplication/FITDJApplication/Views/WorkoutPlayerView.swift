@@ -286,14 +286,18 @@ struct WorkoutPlayerView: View {
         workoutStartTime = Date()
         completedExercises = 0
         
-        // Start the workout with cue manager
-        cueManager.startWorkout(workout)
-        
-        // Start music with user preference (defaulting to high energy for now)
-        // This will gracefully handle Spotify not being connected
-        musicManager.startWorkoutMusic(for: workout, userPreference: .highEnergy)
-        
-        print("✅ Workout started successfully")
+        // Ensure services are properly initialized before starting
+        // Add a small delay to allow services to fully initialize
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Start the workout with cue manager
+            self.cueManager.startWorkout(self.workout)
+            
+            // Start music with user preference (defaulting to high energy for now)
+            // This will gracefully handle Spotify not being connected
+            self.musicManager.startWorkoutMusic(for: self.workout, userPreference: .highEnergy)
+            
+            print("✅ Workout started successfully")
+        }
     }
     
     private func pauseWorkout() {

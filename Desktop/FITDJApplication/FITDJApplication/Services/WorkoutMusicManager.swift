@@ -39,25 +39,34 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     func startWorkoutMusic(for workout: Workout, userPreference: MusicPreference) {
         print("🎵 Starting workout music for: \(workout.title)")
         
-        guard spotifyManager.isConnected else {
-            print("🎵 Spotify not connected. Workout will continue without music.")
-            errorMessage = "Spotify not connected. Workout will continue without music."
-            isPlaying = false
-            isPaused = false
-            return
+        // Add a small delay to ensure Spotify manager is fully initialized
+        // and to allow voice system to set up first
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            
+            guard self.spotifyManager.isConnected else {
+                print("🎵 Spotify not connected. Workout will continue without music.")
+                self.errorMessage = "Spotify not connected. Workout will continue without music."
+                self.isPlaying = false
+                self.isPaused = false
+                return
+            }
+            
+            guard self.spotifyManager.accessToken != nil else {
+                print("🎵 No Spotify access token available")
+                self.errorMessage = "No Spotify access token available"
+                self.isPlaying = false
+                self.isPaused = false
+                return
+            }
+            
+            // Ensure audio session is compatible with voice system
+            self.configureAudioSessionForMusic()
+            
+            let energyLevel = self.getEnergyLevel(for: workout, userPreference: userPreference)
+            print("🎵 Playing playlist for energy level: \(energyLevel)")
+            self.playWorkoutPlaylist(energyLevel: energyLevel)
         }
-        
-        guard spotifyManager.accessToken != nil else {
-            print("🎵 No Spotify access token available")
-            errorMessage = "No Spotify access token available"
-            isPlaying = false
-            isPaused = false
-            return
-        }
-        
-        let energyLevel = getEnergyLevel(for: workout, userPreference: userPreference)
-        print("🎵 Playing playlist for energy level: \(energyLevel)")
-        playWorkoutPlaylist(energyLevel: energyLevel)
     }
     
     func pauseMusic() {
@@ -178,11 +187,26 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     
     private func setupAudioSession() {
         do {
-            // Don't set up audio session here - let VoiceManager handle it
-            // Just ensure we can work with the existing session
+            // Set up audio session that works well with voice system
+            // Use playAndRecord to allow both music and voice
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP, .defaultToSpeaker])
             try audioSession.setActive(true)
+            print("🎵 Music audio session configured to work with voice system")
         } catch {
+            print("❌ Music audio session setup failed: \(error.localizedDescription)")
             errorMessage = "Failed to setup audio session: \(error.localizedDescription)"
+        }
+    }
+    
+    private func configureAudioSessionForMusic() {
+        do {
+            // Configure audio session to work with voice system
+            // Use the same category as voice system to avoid conflicts
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP, .defaultToSpeaker])
+            try audioSession.setActive(true)
+            print("🎵 Audio session configured for music with voice compatibility")
+        } catch {
+            print("❌ Failed to configure audio session for music: \(error.localizedDescription)")
         }
     }
     
@@ -246,16 +270,49 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             return customPlaylistID
         }
         
-        // Fallback to default playlists - using your own playlist
+        // Get playlist options for this energy level
+        let playlistOptions = getPlaylistOptions(for: energyLevel)
+        
+        // Randomly select one playlist from the options
+        if let selectedPlaylist = playlistOptions.randomElement() {
+            print("🎵 Selected playlist for \(energyLevel): \(selectedPlaylist)")
+            return selectedPlaylist
+        }
+        
+        // Fallback to your default playlist
+        return "3M7fmKuBlyCRGDRt653zEZ"
+    }
+    
+    private func getPlaylistOptions(for energyLevel: MusicEnergyLevel) -> [String] {
         switch energyLevel {
         case .low:
-            return "0G9fShP6vrHkdhar2f9ZHx" // Your playlist "★"
+            return [
+                "3M7fmKuBlyCRGDRt653zEZ", // Your playlist "★"
+                // Add more low-energy playlist IDs here:
+                // "37i9dQZF1DX0XUsuxWHRQd", // Example: Chill Vibes
+                // "37i9dQZF1DX4WY4goJxj8s", // Example: Peaceful Piano
+            ]
         case .medium:
-            return "0G9fShP6vrHkdhar2f9ZHx" // Your playlist "★"
+            return [
+                "3M7fmKuBlyCRGDRt653zEZ", // Your playlist "★"
+                // Add more medium-energy playlist IDs here:
+                // "37i9dQZF1DXcBWIGoYBM5M", // Example: Today's Top Hits
+                // "37i9dQZF1DX0XUsuxWHRQd", // Example: Pop Hits
+            ]
         case .high:
-            return "0G9fShP6vrHkdhar2f9ZHx" // Your playlist "★"
+            return [
+                "3M7fmKuBlyCRGDRt653zEZ", // Your playlist "★"
+                // Add more high-energy playlist IDs here:
+                // "37i9dQZF1DX0XUsuxWHRQd", // Example: Workout
+                // "37i9dQZF1DXcBWIGoYBM5M", // Example: High Energy
+            ]
         case .veryHigh:
-            return "0G9fShP6vrHkdhar2f9ZHx" // Your playlist "★"
+            return [
+                "3M7fmKuBlyCRGDRt653zEZ", // Your playlist "★"
+                // Add more very high-energy playlist IDs here:
+                // "37i9dQZF1DX0XUsuxWHRQd", // Example: Intense Workout
+                // "37i9dQZF1DXcBWIGoYBM5M", // Example: Maximum Energy
+            ]
         }
     }
     

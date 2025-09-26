@@ -30,10 +30,18 @@ class WorkoutCueManager: ObservableObject {
     // MARK: - Public Methods
     
     func startWorkout(_ workout: Workout) {
+        print("🏃 WorkoutCueManager: Starting workout: \(workout.title)")
         self.workout = workout
         self.currentExerciseIndex = 0
         self.isActive = true
         
+        // Ensure we have a valid workout with exercises
+        guard !workout.exercises.isEmpty else {
+            print("❌ WorkoutCueManager: No exercises found in workout")
+            return
+        }
+        
+        print("🏃 WorkoutCueManager: Starting first exercise")
         startCurrentExercise()
     }
     

@@ -26,9 +26,14 @@ struct WorkoutLibraryView: View {
         
         // Filter by user's available equipment
         if let profile = authManager.userProfile {
-            workouts = workouts.filter { workout in
-                workout.requiredEquipment.allSatisfy { required in
-                    profile.availableEquipment.contains(required)
+            // If user hasn't set up equipment preferences yet (empty array), show all workouts
+            if profile.availableEquipment.isEmpty {
+                // Don't filter by equipment if user hasn't set preferences
+            } else {
+                workouts = workouts.filter { workout in
+                    workout.requiredEquipment.allSatisfy { required in
+                        profile.availableEquipment.contains(required)
+                    }
                 }
             }
         }
