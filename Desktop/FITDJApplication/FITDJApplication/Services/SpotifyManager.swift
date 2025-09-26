@@ -42,7 +42,7 @@ class SpotifyManager: NSObject, ObservableObject {
         errorMessage = nil
         
         // Create authorization URL
-        let scopes = "user-read-private user-read-email user-read-playback-state user-modify-playback-state user-read-currently-playing"
+        let scopes = "user-read-private user-read-email user-read-playback-state user-modify-playback-state user-read-currently-playing streaming"
         let authURL = "https://accounts.spotify.com/authorize?response_type=code&client_id=\(clientID)&scope=\(scopes.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")&redirect_uri=\(redirectURI.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")"
         
         guard let url = URL(string: authURL) else {
@@ -196,10 +196,13 @@ class SpotifyManager: NSObject, ObservableObject {
         
         if accessToken != nil {
             isConnected = true
+            // Check if token needs refresh (Spotify tokens typically expire in 1 hour)
+            // For now, we'll refresh on every app launch to be safe
+            refreshAccessToken()
         }
     }
     
-    private func refreshAccessToken() {
+    func refreshAccessToken() {
         guard let refreshToken = refreshToken else {
             errorMessage = "No refresh token available"
             return

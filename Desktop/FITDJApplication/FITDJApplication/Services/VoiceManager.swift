@@ -69,7 +69,10 @@ class VoiceManager: NSObject, ObservableObject {
     
     private func setupAudioSession() {
         do {
+            // Set up audio session for playback with proper options
             try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP])
+            
+            // Activate the audio session
             try audioSession.setActive(true)
             
             // Force audio to system speakers (important for simulator)
@@ -80,6 +83,15 @@ class VoiceManager: NSObject, ObservableObject {
         } catch {
             print("❌ Audio session setup failed: \(error.localizedDescription)")
             errorMessage = "Failed to setup audio session: \(error.localizedDescription)"
+            
+            // Try a simpler audio session setup as fallback
+            do {
+                try audioSession.setCategory(.playback)
+                try audioSession.setActive(true)
+                print("✅ Fallback audio session setup successful")
+            } catch {
+                print("❌ Fallback audio session setup also failed: \(error.localizedDescription)")
+            }
         }
     }
     
@@ -153,13 +165,36 @@ class VoiceManager: NSObject, ObservableObject {
     
     private func playAudioData(_ data: Data) {
         do {
+            // Ensure we have valid audio data
+            guard data.count > 0 else {
+                print("❌ Empty audio data received")
+                errorMessage = "Empty audio data received"
+                isSpeaking = false
+                return
+            }
+            
             let audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer.delegate = self
             audioPlayer.volume = 1.0
-            audioPlayer.prepareToPlay()
+            
+            // Prepare the audio player
+            guard audioPlayer.prepareToPlay() else {
+                print("❌ Failed to prepare audio player")
+                errorMessage = "Failed to prepare audio player"
+                isSpeaking = false
+                return
+            }
+            
             print("🔊 Playing audio data (volume: \(audioPlayer.volume), duration: \(audioPlayer.duration)s)")
             let success = audioPlayer.play()
             print("🔊 Audio player play() returned: \(success)")
+            
+            if !success {
+                print("❌ Audio player failed to start playing")
+                errorMessage = "Audio player failed to start"
+                isSpeaking = false
+                return
+            }
             
             // Store the player to prevent it from being deallocated
             self.currentAudioPlayer = audioPlayer

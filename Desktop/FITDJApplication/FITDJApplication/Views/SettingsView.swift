@@ -42,6 +42,10 @@ struct SettingsView: View {
                             spotifyManager.disconnectFromSpotify()
                         }
                     )
+                    
+                    if spotifyManager.isConnected {
+                        PlaylistConfigurationSection()
+                    }
                 }
                 
                 // Subscription Section
@@ -1059,6 +1063,69 @@ struct ReminderSettingsView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Playlist Configuration Section
+struct PlaylistConfigurationSection: View {
+    @State private var customPlaylistID = "1u3COlsOksWVbxVN1J5dE7"
+    @State private var showingPlaylistAlert = false
+    @State private var alertMessage = ""
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "music.note.list")
+                    .foregroundColor(.blue)
+                    .font(.title2)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Workout Playlist")
+                        .font(.headline)
+                        .fontWeight(.medium)
+                    
+                    Text("Customize your workout music")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+            }
+            
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Spotify Playlist ID")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                TextField("Enter playlist ID", text: $customPlaylistID)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                
+                Text("Find your playlist ID in Spotify: Share → Copy link → Extract ID from URL")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                Button("Update Playlist") {
+                    updatePlaylistID()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+            .padding(.top, 8)
+        }
+        .padding(.vertical, 4)
+        .alert("Playlist Updated", isPresented: $showingPlaylistAlert) {
+            Button("OK") { }
+        } message: {
+            Text(alertMessage)
+        }
+    }
+    
+    private func updatePlaylistID() {
+        // Store the playlist ID in UserDefaults
+        UserDefaults.standard.set(customPlaylistID, forKey: "customSpotifyPlaylistID")
+        alertMessage = "Playlist ID updated to: \(customPlaylistID)"
+        showingPlaylistAlert = true
     }
 }
 
