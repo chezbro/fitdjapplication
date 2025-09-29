@@ -7,7 +7,9 @@
 
 import Foundation
 import Combine
+#if canImport(AVFoundation)
 import AVFoundation
+#endif
 
 // F-004 & F-006: Music management with ducking for trainer voice
 @MainActor
@@ -19,7 +21,10 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     @Published var errorMessage: String?
     
     private let spotifyManager: SpotifyManager
+    private let soundCloudManager: SoundCloudManager
+#if canImport(AVFoundation)
     private var audioSession = AVAudioSession.sharedInstance()
+#endif
     private var cancellables = Set<AnyCancellable>()
     
     // Music ducking settings
@@ -27,11 +32,38 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     private let duckedVolume: Float = 0.2
     private var isDucked = false
     
+    // Fade animation settings
+    private var fadeTimer: Timer?
+    private let fadeDuration: TimeInterval = 0.5 // 500ms fade
+    private let fadeSteps: Int = 20 // Number of steps for smooth fade
+    
+    // Performance optimizations
+    private var deviceCache: [SpotifyDevice] = []
+    private var lastDeviceCheck: Date?
+    private let deviceCacheTimeout: TimeInterval = 30.0 // 30 seconds
+    private var activeDeviceID: String?
+    private let backgroundQueue = DispatchQueue(label: "workout.music.background", qos: .userInitiated)
+    private var pendingRequests = Set<String>() // Track pending requests to avoid duplicates
+    
     init(spotifyManager: SpotifyManager) {
         self.spotifyManager = spotifyManager
+        self.soundCloudManager = SoundCloudManager()
         super.init()
         setupAudioSession()
         setupVolumeObserver()
+    }
+    
+    deinit {
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        
+        // Cancel any pending requests
+        pendingRequests.removeAll()
+        
+        // Clear cache
+        deviceCache.removeAll()
+        activeDeviceID = nil
+        lastDeviceCheck = nil
     }
     
     // MARK: - Public Methods
@@ -102,17 +134,63 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     func duckMusic() {
         guard !isDucked else { return }
         
+        print("🎵 Ducking music volume from \(volume) to \(duckedVolume)")
         isDucked = true
-        volume = duckedVolume
-        setSpotifyVolume(duckedVolume)
+        fadeToVolume(duckedVolume)
     }
     
     func unduckMusic() {
         guard isDucked else { return }
         
+        print("🎵 Unducking music volume from \(volume) to \(normalVolume)")
         isDucked = false
-        volume = normalVolume
-        setSpotifyVolume(normalVolume)
+        fadeToVolume(normalVolume)
+    }
+    
+    private func duckMusicForVoice(cueType: String, cueText: String) {
+        guard !isDucked else { return }
+        
+        // Adjust ducking based on cue type
+        let targetVolume: Float
+        let fadeSpeed: TimeInterval
+        
+        switch cueType {
+        case "instruction":
+            // Instructions need more ducking for clarity
+            targetVolume = duckedVolume * 0.7 // Even lower for instructions
+            fadeSpeed = 0.3 // Faster fade for instructions
+        case "countdown":
+            // Countdowns need moderate ducking
+            targetVolume = duckedVolume
+            fadeSpeed = 0.4
+        case "motivation":
+            // Motivational cues can have less ducking
+            targetVolume = duckedVolume * 1.2
+            fadeSpeed = 0.5
+        case "transition":
+            // Transitions need moderate ducking
+            targetVolume = duckedVolume
+            fadeSpeed = 0.4
+        default:
+            targetVolume = duckedVolume
+            fadeSpeed = 0.5
+        }
+        
+        print("🎵 Ducking for \(cueType): volume=\(targetVolume), speed=\(fadeSpeed)s")
+        isDucked = true
+        
+        // Use custom fade speed for this ducking
+        fadeToVolumeWithSpeed(targetVolume, duration: fadeSpeed)
+    }
+    
+    private func unduckMusicAfterVoice() {
+        guard isDucked else { return }
+        
+        print("🎵 Unducking music after voice")
+        isDucked = false
+        
+        // Slightly slower fade back to normal volume for smoother transition
+        fadeToVolumeWithSpeed(normalVolume, duration: 0.8)
     }
     
     func adjustIntensity(easier: Bool, currentWorkout: Workout) {
@@ -128,6 +206,49 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     func clearCustomPlaylistID() {
         UserDefaults.standard.removeObject(forKey: "customSpotifyPlaylistID")
         print("🎵 Custom playlist ID cleared")
+    }
+    
+    // MARK: - SoundCloud Methods
+    
+    func addSoundCloudURL(_ urlString: String) -> Bool {
+        guard soundCloudManager.validateSoundCloudURL(urlString) else {
+            errorMessage = "Invalid SoundCloud URL. Please provide a valid SoundCloud link."
+            return false
+        }
+        
+        guard let track = soundCloudManager.parseSoundCloudURL(urlString) else {
+            errorMessage = "Failed to parse SoundCloud URL. Please check the link and try again."
+            return false
+        }
+        
+        soundCloudManager.addSoundCloudTrackToPlaylist(track, playlistID: "soundcloud_playlist")
+        print("🎵 Added SoundCloud track: \(track.title)")
+        return true
+    }
+    
+    func getSoundCloudTracks() -> [SoundCloudTrack] {
+        return soundCloudManager.getStoredSoundCloudTracks()
+    }
+    
+    func removeSoundCloudTrack(_ trackID: String) {
+        soundCloudManager.removeSoundCloudTrack(trackID)
+    }
+    
+    func clearSoundCloudTracks() {
+        soundCloudManager.clearAllSoundCloudTracks()
+    }
+    
+    func parseSoundCloudURLFromText(_ text: String) -> [SoundCloudTrack] {
+        let urls = soundCloudManager.extractAllSoundCloudURLs(from: text)
+        var tracks: [SoundCloudTrack] = []
+        
+        for url in urls {
+            if let track = soundCloudManager.parseSoundCloudURL(url) {
+                tracks.append(track)
+            }
+        }
+        
+        return tracks
     }
     
     func checkSpotifySetup() -> String {
@@ -148,44 +269,132 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             return
         }
         
-        // Search for workout playlists
-        let query = "workout"
+        // Prevent duplicate search requests
+        let requestKey = "search_playlists"
+        if pendingRequests.contains(requestKey) {
+            print("🎵 Search request already in progress, skipping duplicate")
+            return
+        }
+        pendingRequests.insert(requestKey)
+        
+        // Search for workout playlists with optimized query
+        let query = "workout fitness"
         guard let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "https://api.spotify.com/v1/search?q=\(encodedQuery)&type=playlist&limit=20") else {
+            pendingRequests.remove(requestKey)
             completion([])
             return
         }
         
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10.0
         
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            DispatchQueue.main.async {
-                if let error = error {
-                    print("🎵 Error searching playlists: \(error.localizedDescription)")
-                    completion([])
-                    return
+        // Move search to background queue
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async {
+                    guard let strongSelf = self else {
+                        completion([])
+                        return
+                    }
+                    
+                    strongSelf.pendingRequests.remove(requestKey)
+                    
+                    if let error = error {
+                        print("🎵 Error searching playlists: \(error.localizedDescription)")
+                        completion([])
+                        return
+                    }
+                    
+                    guard let data = data else {
+                        completion([])
+                        return
+                    }
+                    
+                    do {
+                        let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
+                        completion(searchResponse.playlists.items)
+                    } catch {
+                        print("🎵 Failed to parse search response: \(error.localizedDescription)")
+                        completion([])
+                    }
                 }
+            }.resume()
+        }
+    }
+    
+    private func fadeToVolume(_ targetVolume: Float) {
+        fadeToVolumeWithSpeed(targetVolume, duration: fadeDuration)
+    }
+    
+    private func fadeToVolumeWithSpeed(_ targetVolume: Float, duration: TimeInterval) {
+        // Cancel any existing fade
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        
+        let startVolume = volume
+        let volumeDifference = targetVolume - startVolume
+        
+        // Skip fade if volume difference is too small
+        if abs(volumeDifference) < 0.05 {
+            volume = targetVolume
+            setSpotifyVolume(targetVolume)
+            return
+        }
+        
+        let stepSize = volumeDifference / Float(fadeSteps)
+        let timeStep = duration / Double(fadeSteps)
+        
+        print("🎵 Starting fade from \(startVolume) to \(targetVolume) over \(duration)s")
+        
+        var currentStep = 0
+        fadeTimer = Timer.scheduledTimer(withTimeInterval: timeStep, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            
+            currentStep += 1
+            let newVolume = startVolume + (stepSize * Float(currentStep))
+            
+            // Clamp volume to valid range
+            let clampedVolume = max(0.0, min(1.0, newVolume))
+            
+            // Only update volume every few steps to reduce API calls during fade
+            if currentStep % 3 == 0 || currentStep >= self.fadeSteps {
+                print("🎵 Fade step \(currentStep)/\(self.fadeSteps): volume = \(clampedVolume)")
                 
-                guard let data = data else {
-                    completion([])
-                    return
+                // Update local volume and Spotify volume on main thread
+                Task { @MainActor in
+                    self.volume = clampedVolume
+                    self.setSpotifyVolume(clampedVolume)
                 }
-                
-                do {
-                    let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
-                    completion(searchResponse.playlists.items)
-                } catch {
-                    print("🎵 Failed to parse search response: \(error.localizedDescription)")
-                    completion([])
+            } else {
+                // Update local volume without API call for intermediate steps
+                Task { @MainActor in
+                    self.volume = clampedVolume
                 }
             }
-        }.resume()
+            
+            // Check if we've reached the target or completed all steps
+            if currentStep >= self.fadeSteps || abs(clampedVolume - targetVolume) < 0.01 {
+                // Ensure we end exactly at target volume
+                Task { @MainActor in
+                    self.volume = targetVolume
+                    self.setSpotifyVolume(targetVolume)
+                    print("🎵 Fade complete: final volume = \(targetVolume)")
+                    timer.invalidate()
+                    self.fadeTimer = nil
+                }
+            }
+        }
     }
     
     // MARK: - Private Methods
     
     private func setupAudioSession() {
+#if canImport(AVFoundation)
         do {
             // Set up audio session that works well with voice system
             // Use playAndRecord to allow both music and voice
@@ -196,9 +405,11 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             print("❌ Music audio session setup failed: \(error.localizedDescription)")
             errorMessage = "Failed to setup audio session: \(error.localizedDescription)"
         }
+#endif
     }
     
     private func configureAudioSessionForMusic() {
+#if canImport(AVFoundation)
         do {
             // Configure audio session to work with voice system
             // Use the same category as voice system to avoid conflicts
@@ -208,17 +419,24 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         } catch {
             print("❌ Failed to configure audio session for music: \(error.localizedDescription)")
         }
+#endif
     }
     
     private func setupVolumeObserver() {
-        // Monitor for voice manager speaking state
+        // Monitor for voice manager speaking state with enhanced info
         NotificationCenter.default.publisher(for: .voiceManagerSpeaking)
             .sink { [weak self] notification in
                 if let isSpeaking = notification.object as? Bool {
+                    let userInfo = notification.userInfo
+                    let cueText = userInfo?["cueText"] as? String ?? ""
+                    let cueType = userInfo?["cueType"] as? String ?? ""
+                    
+                    print("🎵 Voice state changed: speaking=\(isSpeaking), type=\(cueType), text='\(cueText.prefix(50))...'")
+                    
                     if isSpeaking {
-                        self?.duckMusic()
+                        self?.duckMusicForVoice(cueType: cueType, cueText: cueText)
                     } else {
-                        self?.unduckMusic()
+                        self?.unduckMusicAfterVoice()
                     }
                 }
             }
@@ -331,48 +549,97 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     }
     
     private func checkActiveDevice(accessToken: String, completion: @escaping (Bool) -> Void) {
+        // Check cache first
+        if let lastCheck = lastDeviceCheck,
+           Date().timeIntervalSince(lastCheck) < deviceCacheTimeout,
+           !deviceCache.isEmpty {
+            let activeDevices = deviceCache.filter { $0.is_active }
+            let hasActiveDevice = !activeDevices.isEmpty
+            print("🎵 Using cached device data: \(deviceCache.count) total devices, \(activeDevices.count) active")
+            
+            if !hasActiveDevice && !deviceCache.isEmpty {
+                print("🎵 No active devices found in cache, trying to activate first device...")
+                activateFirstDevice(deviceCache.first!, accessToken: accessToken) { success in
+                    completion(success)
+                }
+            } else {
+                completion(hasActiveDevice)
+            }
+            return
+        }
+        
+        // Prevent duplicate requests
+        let requestKey = "device_check_\(accessToken.prefix(10))"
+        if pendingRequests.contains(requestKey) {
+            print("🎵 Device check already in progress, skipping duplicate request")
+            return
+        }
+        pendingRequests.insert(requestKey)
+        
         guard let url = URL(string: "https://api.spotify.com/v1/me/player/devices") else {
+            pendingRequests.remove(requestKey)
             completion(false)
             return
         }
         
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10.0 // Add timeout
         
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            DispatchQueue.main.async {
-                if let error = error {
-                    print("🎵 Error checking devices: \(error.localizedDescription)")
-                    completion(false)
-                    return
-                }
-                
-                guard let data = data else {
-                    print("🎵 No device data received")
-                    completion(false)
-                    return
-                }
-                
-                do {
-                    let deviceResponse = try JSONDecoder().decode(SpotifyDevicesResponse.self, from: data)
+        // Move network request to background queue
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async {
+                    guard let strongSelf = self else {
+                        completion(false)
+                        return
+                    }
+                    
+                    strongSelf.pendingRequests.remove(requestKey)
+                    
+                    if let error = error {
+                        print("🎵 Error checking devices: \(error.localizedDescription)")
+                        completion(false)
+                        return
+                    }
+                    
+                    guard let data = data else {
+                        print("🎵 No device data received")
+                        completion(false)
+                        return
+                    }
+                    
+                    do {
+                        let deviceResponse = try JSONDecoder().decode(SpotifyDevicesResponse.self, from: data)
+                        
+                    // Update cache
+                    strongSelf.deviceCache = deviceResponse.devices
+                    strongSelf.lastDeviceCheck = Date()
+                    
                     let activeDevices = deviceResponse.devices.filter { $0.is_active }
                     let hasActiveDevice = !activeDevices.isEmpty
                     print("🎵 Found \(deviceResponse.devices.count) total devices, \(activeDevices.count) active")
                     
+                    // Cache the first active device ID
+                    if let activeDevice = activeDevices.first {
+                        strongSelf.activeDeviceID = activeDevice.id
+                    }
+                    
                     if !hasActiveDevice && !deviceResponse.devices.isEmpty {
                         print("🎵 No active devices found, but devices available. Trying to activate first device...")
-                        self.activateFirstDevice(deviceResponse.devices.first!, accessToken: accessToken) { success in
+                        strongSelf.activateFirstDevice(deviceResponse.devices.first!, accessToken: accessToken) { success in
                             completion(success)
                         }
                     } else {
                         completion(hasActiveDevice)
                     }
-                } catch {
-                    print("🎵 Failed to parse device response: \(error.localizedDescription)")
-                    completion(false)
+                    } catch {
+                        print("🎵 Failed to parse device response: \(error.localizedDescription)")
+                        completion(false)
+                    }
                 }
-            }
-        }.resume()
+            }.resume()
+        }
     }
     
     private func activateFirstDevice(_ device: SpotifyDevice, accessToken: String, completion: @escaping (Bool) -> Void) {
@@ -427,9 +694,18 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     }
     
     private func performPlayback(playlistID: String, accessToken: String) {
+        // Prevent duplicate playback requests
+        let requestKey = "playback_\(playlistID)"
+        if pendingRequests.contains(requestKey) {
+            print("🎵 Playback request already in progress for playlist: \(playlistID)")
+            return
+        }
+        pendingRequests.insert(requestKey)
+        
         guard let url = URL(string: "https://api.spotify.com/v1/me/player/play") else {
             print("🎵 Invalid Spotify playback URL")
             errorMessage = "Invalid Spotify playback URL"
+            pendingRequests.remove(requestKey)
             return
         }
         
@@ -437,13 +713,25 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         request.httpMethod = "PUT"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15.0 // Add timeout
         
-        // Try a different approach - use the device_id parameter
-        let requestBody = SpotifyPlaybackRequestWithDevice(
-            context_uri: "spotify:playlist:\(playlistID)",
-            offset: ["position": 0],
-            position_ms: 0
-        )
+        // Optimize request body - use simpler structure when possible
+        let requestBody: SpotifyPlaybackRequestWithDevice
+        if let deviceID = activeDeviceID {
+            // Use cached device ID if available
+            requestBody = SpotifyPlaybackRequestWithDevice(
+                context_uri: "spotify:playlist:\(playlistID)",
+                offset: ["position": 0],
+                position_ms: 0,
+                device_id: deviceID
+            )
+        } else {
+            requestBody = SpotifyPlaybackRequestWithDevice(
+                context_uri: "spotify:playlist:\(playlistID)",
+                offset: ["position": 0],
+                position_ms: 0
+            )
+        }
         
         do {
             request.httpBody = try JSONEncoder().encode(requestBody)
@@ -451,53 +739,59 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         } catch {
             print("🎵 Failed to encode playback request: \(error.localizedDescription)")
             errorMessage = "Failed to encode playback request: \(error.localizedDescription)"
+            pendingRequests.remove(requestKey)
             return
         }
         
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                
-                if let error = error {
-                    print("🎵 Failed to start playback: \(error.localizedDescription)")
-                    self.errorMessage = "Failed to start playback: \(error.localizedDescription)"
-                    return
-                }
-                
-                if let httpResponse = response as? HTTPURLResponse {
-                    print("🎵 Spotify playback response: \(httpResponse.statusCode)")
+        // Move network request to background queue
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async {
+                    guard let strongSelf = self else { return }
                     
-                    if httpResponse.statusCode == 404 {
-                        print("🎵 Playlist not found (404). Playlist ID: \(playlistID)")
-                        // Try to verify the playlist exists by fetching its details
-                        self.verifyPlaylistExists(playlistID: playlistID, accessToken: accessToken)
-                        return
-                    } else if httpResponse.statusCode == 403 {
-                        print("🎵 Forbidden (403). Check if you have Spotify Premium and proper permissions.")
-                        self.errorMessage = "Access denied. Please ensure you have Spotify Premium and the playlist is accessible."
-                        return
-                    } else if httpResponse.statusCode == 401 {
-                        print("🎵 Unauthorized (401). Token may be expired.")
-                        self.errorMessage = "Authentication failed. Please reconnect to Spotify."
-                        // Try to refresh the token
-                        self.spotifyManager.refreshAccessToken()
-                        return
-                    } else if httpResponse.statusCode == 204 {
-                        print("🎵 Music started successfully!")
-                        self.isPlaying = true
-                        self.isPaused = false
-                        self.errorMessage = nil
-                    } else {
-                        print("🎵 Unexpected response code: \(httpResponse.statusCode)")
-                        if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                            print("🎵 Response body: \(responseString)")
-                        }
-                        self.errorMessage = "Unexpected response from Spotify: \(httpResponse.statusCode)"
+                    strongSelf.pendingRequests.remove(requestKey)
+                    
+                    if let error = error {
+                        print("🎵 Failed to start playback: \(error.localizedDescription)")
+                        strongSelf.errorMessage = "Failed to start playback: \(error.localizedDescription)"
                         return
                     }
+                    
+                    if let httpResponse = response as? HTTPURLResponse {
+                        print("🎵 Spotify playback response: \(httpResponse.statusCode)")
+                        
+                        if httpResponse.statusCode == 404 {
+                            print("🎵 Playlist not found (404). Playlist ID: \(playlistID)")
+                            // Try to verify the playlist exists by fetching its details
+                            self.verifyPlaylistExists(playlistID: playlistID, accessToken: accessToken)
+                            return
+                        } else if httpResponse.statusCode == 403 {
+                            print("🎵 Forbidden (403). Check if you have Spotify Premium and proper permissions.")
+                            self.errorMessage = "Access denied. Please ensure you have Spotify Premium and the playlist is accessible."
+                            return
+                        } else if httpResponse.statusCode == 401 {
+                            print("🎵 Unauthorized (401). Token may be expired.")
+                            self.errorMessage = "Authentication failed. Please reconnect to Spotify."
+                            // Try to refresh the token
+                            self.spotifyManager.refreshAccessToken()
+                            return
+                        } else if httpResponse.statusCode == 204 {
+                            print("🎵 Music started successfully!")
+                            self.isPlaying = true
+                            self.isPaused = false
+                            self.errorMessage = nil
+                        } else {
+                            print("🎵 Unexpected response code: \(httpResponse.statusCode)")
+                            if let data = data, let responseString = String(data: data, encoding: .utf8) {
+                                print("🎵 Response body: \(responseString)")
+                            }
+                            self.errorMessage = "Unexpected response from Spotify: \(httpResponse.statusCode)"
+                            return
+                        }
+                    }
                 }
-            }
-        }.resume()
+            }.resume()
+        }
     }
     
     private func verifyPlaylistExists(playlistID: String, accessToken: String) {
@@ -711,90 +1005,120 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     private func findWorkingPlaylist(accessToken: String) {
         print("🎵 Searching for a working playlist...")
         
+        // Prevent duplicate requests
+        let requestKey = "find_working_playlist"
+        if pendingRequests.contains(requestKey) {
+            print("🎵 Find working playlist request already in progress")
+            return
+        }
+        pendingRequests.insert(requestKey)
+        
         // First try to get user's own playlists
         guard let url = URL(string: "https://api.spotify.com/v1/me/playlists?limit=20") else {
             self.errorMessage = "Failed to access your playlists. Please try reconnecting to Spotify."
+            pendingRequests.remove(requestKey)
             return
         }
         
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10.0
         
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                
-                if let error = error {
-                    print("🎵 Error getting user playlists: \(error.localizedDescription)")
-                    self.errorMessage = "Failed to get your playlists. Please try reconnecting to Spotify."
-                    return
-                }
-                
-                guard let data = data else {
-                    self.errorMessage = "No playlist data received. Please try reconnecting to Spotify."
-                    return
-                }
-                
-                do {
-                    let userPlaylists = try JSONDecoder().decode(SpotifyUserPlaylistsResponse.self, from: data)
-                    if let firstPlaylist = userPlaylists.items.first {
-                        print("🎵 Found user playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
-                        self.setCustomPlaylistID(firstPlaylist.id)
-                        self.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
-                    } else {
-                        print("🎵 No user playlists found, trying search...")
+        // Move to background queue
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async {
+                    guard let strongSelf = self else { return }
+                    
+                    strongSelf.pendingRequests.remove(requestKey)
+                    
+                    if let error = error {
+                        print("🎵 Error getting user playlists: \(error.localizedDescription)")
+                        self.errorMessage = "Failed to get your playlists. Please try reconnecting to Spotify."
+                        return
+                    }
+                    
+                    guard let data = data else {
+                        self.errorMessage = "No playlist data received. Please try reconnecting to Spotify."
+                        return
+                    }
+                    
+                    do {
+                        let userPlaylists = try JSONDecoder().decode(SpotifyUserPlaylistsResponse.self, from: data)
+                        if let firstPlaylist = userPlaylists.items.first {
+                            print("🎵 Found user playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
+                            self.setCustomPlaylistID(firstPlaylist.id)
+                            self.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
+                        } else {
+                            print("🎵 No user playlists found, trying search...")
+                            self.searchForWorkingPlaylist(accessToken: accessToken)
+                        }
+                    } catch {
+                        print("🎵 Failed to parse user playlists: \(error.localizedDescription)")
                         self.searchForWorkingPlaylist(accessToken: accessToken)
                     }
-                } catch {
-                    print("🎵 Failed to parse user playlists: \(error.localizedDescription)")
-                    self.searchForWorkingPlaylist(accessToken: accessToken)
                 }
-            }
-        }.resume()
+            }.resume()
+        }
     }
     
     private func searchForWorkingPlaylist(accessToken: String) {
         print("🎵 Searching for public workout playlists...")
         
-        guard let encodedQuery = "workout".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        // Prevent duplicate requests
+        let requestKey = "search_working_playlist"
+        if pendingRequests.contains(requestKey) {
+            print("🎵 Search working playlist request already in progress")
+            return
+        }
+        pendingRequests.insert(requestKey)
+        
+        guard let encodedQuery = "workout fitness".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "https://api.spotify.com/v1/search?q=\(encodedQuery)&type=playlist&limit=10") else {
             self.errorMessage = "Failed to search for playlists. Please try reconnecting to Spotify."
+            pendingRequests.remove(requestKey)
             return
         }
         
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10.0
         
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                
-                if let error = error {
-                    print("🎵 Error searching playlists: \(error.localizedDescription)")
-                    self.errorMessage = "Failed to search for playlists. Please try reconnecting to Spotify."
-                    return
-                }
-                
-                guard let data = data else {
-                    self.errorMessage = "No search results received. Please try reconnecting to Spotify."
-                    return
-                }
-                
-                do {
-                    let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
-                    if let firstPlaylist = searchResponse.playlists.items.first {
-                        print("🎵 Found public playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
-                        self.setCustomPlaylistID(firstPlaylist.id)
-                        self.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
-                    } else {
-                        self.errorMessage = "No accessible playlists found. Please create a playlist in Spotify and try again."
+        // Move to background queue
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async {
+                    guard let strongSelf = self else { return }
+                    
+                    strongSelf.pendingRequests.remove(requestKey)
+                    
+                    if let error = error {
+                        print("🎵 Error searching playlists: \(error.localizedDescription)")
+                        self.errorMessage = "Failed to search for playlists. Please try reconnecting to Spotify."
+                        return
                     }
-                } catch {
-                    print("🎵 Failed to parse search results: \(error.localizedDescription)")
-                    self.errorMessage = "Failed to find working playlists. Please try reconnecting to Spotify."
+                    
+                    guard let data = data else {
+                        self.errorMessage = "No search results received. Please try reconnecting to Spotify."
+                        return
+                    }
+                    
+                    do {
+                        let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
+                        if let firstPlaylist = searchResponse.playlists.items.first {
+                            print("🎵 Found public playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
+                            self.setCustomPlaylistID(firstPlaylist.id)
+                            self.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
+                        } else {
+                            self.errorMessage = "No accessible playlists found. Please create a playlist in Spotify and try again."
+                        }
+                    } catch {
+                        print("🎵 Failed to parse search results: \(error.localizedDescription)")
+                        self.errorMessage = "Failed to find working playlists. Please try reconnecting to Spotify."
+                    }
                 }
-            }
-        }.resume()
+            }.resume()
+        }
     }
     
     private func pauseSpotifyPlayback() {
@@ -836,14 +1160,33 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     private func setSpotifyVolume(_ volume: Float) {
         guard let accessToken = spotifyManager.accessToken else { return }
         
+        // Throttle volume changes to avoid API spam during fade
         let volumePercent = Int(volume * 100)
+        
+        // Skip API call if volume change is minimal
+        if abs(volume - (self.volume)) < 0.05 {
+            return
+        }
+        
         guard let url = URL(string: "https://api.spotify.com/v1/me/player/volume?volume_percent=\(volumePercent)") else { return }
         
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 5.0 // Shorter timeout for volume changes
         
-        URLSession.shared.dataTask(with: request).resume()
+        // Move volume change to background queue
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { _, response, error in
+                if let error = error {
+                    print("🎵 Volume change error: \(error.localizedDescription)")
+                } else if let httpResponse = response as? HTTPURLResponse {
+                    if httpResponse.statusCode != 204 {
+                        print("🎵 Volume change failed with status: \(httpResponse.statusCode)")
+                    }
+                }
+            }.resume()
+        }
     }
 }
 
@@ -908,6 +1251,14 @@ struct SpotifyPlaybackRequestWithDevice: Codable {
     let context_uri: String
     let offset: [String: Int]
     let position_ms: Int
+    let device_id: String?
+    
+    init(context_uri: String, offset: [String: Int], position_ms: Int, device_id: String? = nil) {
+        self.context_uri = context_uri
+        self.offset = offset
+        self.position_ms = position_ms
+        self.device_id = device_id
+    }
 }
 
 struct SpotifyDevicesResponse: Codable {

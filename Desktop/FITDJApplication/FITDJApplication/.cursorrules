@@ -82,3 +82,6 @@
 
 ## 11. No Modules
 - Don't create extra modules or packages. Keep all files in the same target and project.
+
+## 12. Testing / Simulator
+- Always test in the iOS simulator (Use iPhone 16 and above)

@@ -46,6 +46,8 @@ struct SettingsView: View {
                     if spotifyManager.isConnected {
                         PlaylistConfigurationSection()
                     }
+                    
+                    SoundCloudSection()
                 }
                 
                 // Subscription Section
@@ -1126,6 +1128,91 @@ struct PlaylistConfigurationSection: View {
         UserDefaults.standard.set(customPlaylistID, forKey: "customSpotifyPlaylistID")
         alertMessage = "Playlist ID updated to: \(customPlaylistID)"
         showingPlaylistAlert = true
+    }
+}
+
+// MARK: - SoundCloud Section
+struct SoundCloudSection: View {
+    @State private var showingSoundCloudURL = false
+    @State private var showingSoundCloudTracks = false
+    @State private var soundCloudTracks: [SoundCloudTrack] = []
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "music.note.house")
+                    .foregroundColor(.orange)
+                    .font(.title2)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("SoundCloud Tracks")
+                        .font(.headline)
+                        .fontWeight(.medium)
+                    
+                    Text("Add SoundCloud songs to your workout playlist")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+            }
+            
+            HStack(spacing: 12) {
+                Button("Add SoundCloud URL") {
+                    showingSoundCloudURL = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                
+                Button("View Tracks (\(soundCloudTracks.count))") {
+                    showingSoundCloudTracks = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(soundCloudTracks.isEmpty)
+            }
+            .padding(.top, 8)
+        }
+        .padding(.vertical, 4)
+        .onAppear {
+            loadSoundCloudTracks()
+        }
+        .sheet(isPresented: $showingSoundCloudURL) {
+            SoundCloudURLView(
+                onURLAdded: { url in
+                    addSoundCloudURL(url)
+                },
+                onCancel: {
+                    showingSoundCloudURL = false
+                }
+            )
+        }
+        .sheet(isPresented: $showingSoundCloudTracks) {
+            SoundCloudTrackListView(
+                onTrackRemoved: { trackID in
+                    removeSoundCloudTrack(trackID)
+                }
+            )
+        }
+    }
+    
+    private func loadSoundCloudTracks() {
+        // This would typically come from your WorkoutMusicManager
+        // For now, we'll show a placeholder
+        soundCloudTracks = []
+    }
+    
+    private func addSoundCloudURL(_ url: String) {
+        // This would typically call your WorkoutMusicManager
+        print("Adding SoundCloud URL: \(url)")
+        showingSoundCloudURL = false
+        loadSoundCloudTracks()
+    }
+    
+    private func removeSoundCloudTrack(_ trackID: String) {
+        // This would typically call your WorkoutMusicManager
+        print("Removing SoundCloud track: \(trackID)")
+        loadSoundCloudTracks()
     }
 }
 

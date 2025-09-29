@@ -505,8 +505,13 @@ class VoiceManager: NSObject, ObservableObject {
             // Store the player to prevent it from being deallocated
             self.currentAudioPlayer = audioPlayer
             
-            // Post notification that we're speaking
-            NotificationCenter.default.post(name: .voiceManagerSpeaking, object: true)
+            // Post notification that we're speaking with detailed info
+            let speakingInfo = [
+                "isSpeaking": true,
+                "cueText": currentCue?.text ?? "",
+                "cueType": currentCue?.type.rawValue ?? ""
+            ] as [String : Any]
+            NotificationCenter.default.post(name: .voiceManagerSpeaking, object: true, userInfo: speakingInfo)
             
         } catch {
             print("❌ Failed to create/play audio: \(error.localizedDescription)")
@@ -577,7 +582,14 @@ extension VoiceManager: AVSpeechSynthesizerDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.isSpeaking = true
         }
-        NotificationCenter.default.post(name: .voiceManagerSpeaking, object: true)
+        
+        // Post notification with detailed speaking info
+        let speakingInfo = [
+            "isSpeaking": true,
+            "cueText": utterance.speechString,
+            "cueType": "system_voice"
+        ] as [String : Any]
+        NotificationCenter.default.post(name: .voiceManagerSpeaking, object: true, userInfo: speakingInfo)
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {

@@ -16,7 +16,7 @@ class WorkoutCueManager: ObservableObject {
     @Published var isPaused = false
     @Published var timeRemainingInCurrentExercise = 0
     
-    private let voiceManager: VoiceManager
+    let voiceManager: VoiceManager
     private var workout: Workout?
     var currentExerciseIndex = 0
     private var exerciseStartTime: Date?
@@ -42,6 +42,22 @@ class WorkoutCueManager: ObservableObject {
         }
         
         print("🏃 WorkoutCueManager: Starting first exercise")
+        startCurrentExercise()
+    }
+    
+    func startWorkoutWithMusic(_ workout: Workout) {
+        print("🏃 WorkoutCueManager: Starting workout with music: \(workout.title)")
+        self.workout = workout
+        self.currentExerciseIndex = 0
+        self.isActive = true
+        
+        // Ensure we have a valid workout with exercises
+        guard !workout.exercises.isEmpty else {
+            print("❌ WorkoutCueManager: No exercises found in workout")
+            return
+        }
+        
+        print("🏃 WorkoutCueManager: Starting first exercise with music")
         startCurrentExercise()
     }
     
