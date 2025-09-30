@@ -8,12 +8,18 @@
 import Foundation
 import AVFoundation
 import Combine
+import CryptoKit
 
 // F-005: AI voice gives instructions, countdowns, and motivation
 class VoiceManager: NSObject, ObservableObject {
     @Published var isSpeaking = false
     @Published var currentCue: VoiceCue?
     @Published var errorMessage: String?
+    @Published var voiceVolume: Float = 1.0 // User-controlled voice volume (0.0 to 1.0)
+    @Published var useElevenLabs: Bool = true // User preference for voice provider
+    @Published var elevenLabsCreditsRemaining: Int = 2000 // Track remaining credits
+    @Published var cacheHitCount: Int = 0 // Track cache hits
+    @Published var cacheMissCount: Int = 0 // Track cache misses
     
     private let synthesizer = AVSpeechSynthesizer()
     private var audioSession = AVAudioSession.sharedInstance()
@@ -27,15 +33,31 @@ class VoiceManager: NSObject, ObservableObject {
     private var elevenLabsRetryCount = 0
     private let maxRetries = 2
     
+    // Voice caching system
+    private let cacheDirectory: URL
+    private let maxCacheSize: Int64 = 100 * 1024 * 1024 // 100MB cache limit
+    private let cacheExpirationDays = 30 // Cache expires after 30 days
+    
     // ElevenLabs API credentials from instructions.md
-    private let apiKey = "sk_af34df5101d4e23cf1b8137164cf638a7a5b643674d0eedd"
+    private let apiKey = "sk_8897ac346a30c272330d29230fd2c327918acc4870da52e8"
     private let voiceID = "egTToTzW6GojvddLj0zd"
     private let baseURL = "https://api.elevenlabs.io/v1"
     
     override init() {
+        // Setup cache directory
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        self.cacheDirectory = documentsPath.appendingPathComponent("VoiceCache")
+        
         super.init()
         setupAudioSession()
+        setupCacheDirectory()
         synthesizer.delegate = self
+        
+        // Load user preferences
+        loadUserPreferences()
+        
+        // Clean up old cache files
+        cleanupExpiredCache()
     }
     
     // MARK: - Public Methods
@@ -97,6 +119,12 @@ class VoiceManager: NSObject, ObservableObject {
         print("🎤 ElevenLabs Voice ID: \(voiceID)")
         print("🎤 ElevenLabs Base URL: \(baseURL)")
         print("🎤 Skip ElevenLabs: \(UserDefaults.standard.bool(forKey: "skipElevenLabs"))")
+        print("🎤 Use ElevenLabs: \(useElevenLabs)")
+        print("🎤 Credits Remaining: \(elevenLabsCreditsRemaining)")
+        print("🎤 Cache Hits: \(cacheHitCount)")
+        print("🎤 Cache Misses: \(cacheMissCount)")
+        print("🎤 Cache Directory: \(cacheDirectory.path)")
+        print("🎤 Cache Size: \(getCacheSize()) bytes")
         print("🎤 Audio session category: \(audioSession.category.rawValue)")
         print("🎤 Audio session mode: \(audioSession.mode.rawValue)")
         print("🎤 Audio session active: \(audioSession.isOtherAudioPlaying)")
@@ -105,10 +133,43 @@ class VoiceManager: NSObject, ObservableObject {
         print("🎤 Current audio player: \(currentAudioPlayer != nil ? "Active" : "None")")
     }
     
+    // MARK: - Voice Provider Management
+    
+    func setVoiceProvider(_ useElevenLabs: Bool) {
+        self.useElevenLabs = useElevenLabs
+        UserDefaults.standard.set(useElevenLabs, forKey: "useElevenLabs")
+        print("🎤 Voice provider set to: \(useElevenLabs ? "ElevenLabs" : "System Voice")")
+    }
+    
+    func setElevenLabsCredits(_ credits: Int) {
+        self.elevenLabsCreditsRemaining = credits
+        UserDefaults.standard.set(credits, forKey: "elevenLabsCredits")
+        print("🎤 ElevenLabs credits set to: \(credits)")
+    }
+    
+    func clearCache() {
+        do {
+            let fileManager = FileManager.default
+            if fileManager.fileExists(atPath: cacheDirectory.path) {
+                try fileManager.removeItem(at: cacheDirectory)
+                try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+                print("🎤 Voice cache cleared successfully")
+            }
+        } catch {
+            print("❌ Failed to clear cache: \(error.localizedDescription)")
+        }
+    }
+    
     // MARK: - Private Methods
     
     private func setupAudioSession() {
         do {
+            // Check if audio session is already configured
+            if audioSession.category == .playAndRecord {
+                print("✅ Audio session already configured")
+                return
+            }
+            
             // Set up audio session for playback with proper options that work with music
             try audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP, .defaultToSpeaker])
             
@@ -134,6 +195,20 @@ class VoiceManager: NSObject, ObservableObject {
     
     private func queueVoiceCue(_ cue: VoiceCue) {
         print("🎤 Queuing voice cue: \(cue.text)")
+        
+        // Check for duplicate cues to prevent conflicts
+        let isDuplicate = voiceQueue.contains { existingCue in
+            existingCue.id == cue.id || existingCue.text == cue.text
+        }
+        
+        // Also check if we're currently speaking the same cue
+        let isCurrentlySpeaking = currentCue?.id == cue.id || currentCue?.text == cue.text
+        
+        if isDuplicate || isCurrentlySpeaking {
+            print("🎤 Skipping duplicate voice cue: \(cue.text)")
+            return
+        }
+        
         voiceQueue.append(cue)
         processNextVoiceCue()
     }
@@ -167,6 +242,12 @@ class VoiceManager: NSObject, ObservableObject {
     
     private func ensureAudioSessionForVoice() -> Bool {
         do {
+            // Check if audio session is already properly configured
+            if audioSession.category == .playAndRecord {
+                print("🎤 Audio session already configured for voice playback")
+                return true
+            }
+            
             // Temporarily reconfigure audio session for voice playback
             try audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP, .defaultToSpeaker])
             try audioSession.setActive(true)
@@ -184,6 +265,23 @@ class VoiceManager: NSObject, ObservableObject {
     }
     
     private func generateAndPlayVoiceWithRetry(text: String) {
+        // Check if we should use ElevenLabs or fallback
+        if !useElevenLabs {
+            print("🎤 Using system voice (ElevenLabs disabled)")
+            fallbackToSystemVoice(text: text)
+            return
+        }
+        
+        // Check cache first
+        if let cachedData = getCachedVoice(text: text) {
+            print("🎤 Using cached voice for: \(text)")
+            cacheHitCount += 1
+            playAudioData(cachedData)
+            return
+        }
+        
+        print("🎤 Cache miss for: \(text)")
+        cacheMissCount += 1
         generateAndPlayVoice(text: text)
     }
     
@@ -405,6 +503,17 @@ class VoiceManager: NSObject, ObservableObject {
                 }
                 
                 print("✅ ElevenLabs API success, playing audio data (\(data.count) bytes))")
+                
+                // Cache the audio data for future use
+                self?.cacheVoice(text: text, data: data)
+                
+                // Decrement credits (estimate based on text length)
+                let estimatedCredits = max(1, text.count / 10) // Rough estimate: 1 credit per 10 characters
+                self?.elevenLabsCreditsRemaining = max(0, (self?.elevenLabsCreditsRemaining ?? 0) - estimatedCredits)
+                self?.saveUserPreferences()
+                
+                print("🎤 Credits used: \(estimatedCredits), Remaining: \(self?.elevenLabsCreditsRemaining ?? 0)")
+                
                 self?.playAudioData(data)
             }
         }.resume()
@@ -452,7 +561,7 @@ class VoiceManager: NSObject, ObservableObject {
             print("🔊 Creating AVAudioPlayer with data...")
             let audioPlayer = try AVAudioPlayer(data: data)
             audioPlayer.delegate = self
-            audioPlayer.volume = 1.0
+            audioPlayer.volume = voiceVolume
             
             print("🔊 Audio player created successfully")
             print("🔊 Audio player properties:")
@@ -545,7 +654,7 @@ class VoiceManager: NSObject, ObservableObject {
         // Create utterance
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = 0.5
-        utterance.volume = 1.0
+        utterance.volume = voiceVolume
         
         // Try to find a good English voice
         let englishVoices = availableVoices.filter { $0.language.hasPrefix("en") }
@@ -572,6 +681,162 @@ class VoiceManager: NSObject, ObservableObject {
         print("🎤 Starting system voice synthesis...")
         synthesizer.speak(utterance)
         print("🎤 System voice synthesis started")
+    }
+    
+    // MARK: - Cache Management
+    
+    private func setupCacheDirectory() {
+        do {
+            let fileManager = FileManager.default
+            if !fileManager.fileExists(atPath: cacheDirectory.path) {
+                try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+                print("🎤 Cache directory created: \(cacheDirectory.path)")
+            }
+        } catch {
+            print("❌ Failed to create cache directory: \(error.localizedDescription)")
+        }
+    }
+    
+    private func loadUserPreferences() {
+        useElevenLabs = UserDefaults.standard.object(forKey: "useElevenLabs") as? Bool ?? true
+        elevenLabsCreditsRemaining = UserDefaults.standard.object(forKey: "elevenLabsCredits") as? Int ?? 2000
+        cacheHitCount = UserDefaults.standard.object(forKey: "cacheHitCount") as? Int ?? 0
+        cacheMissCount = UserDefaults.standard.object(forKey: "cacheMissCount") as? Int ?? 0
+    }
+    
+    private func saveUserPreferences() {
+        UserDefaults.standard.set(useElevenLabs, forKey: "useElevenLabs")
+        UserDefaults.standard.set(elevenLabsCreditsRemaining, forKey: "elevenLabsCredits")
+        UserDefaults.standard.set(cacheHitCount, forKey: "cacheHitCount")
+        UserDefaults.standard.set(cacheMissCount, forKey: "cacheMissCount")
+    }
+    
+    private func getCacheKey(for text: String) -> String {
+        let data = text.data(using: .utf8) ?? Data()
+        let hash = SHA256.hash(data: data)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+    
+    private func getCachedVoice(text: String) -> Data? {
+        let cacheKey = getCacheKey(for: text)
+        let cacheFile = cacheDirectory.appendingPathComponent("\(cacheKey).mp3")
+        
+        guard FileManager.default.fileExists(atPath: cacheFile.path) else {
+            return nil
+        }
+        
+        // Check if cache file is expired
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: cacheFile.path)
+            if let modificationDate = attributes[.modificationDate] as? Date {
+                let daysSinceModified = Calendar.current.dateComponents([.day], from: modificationDate, to: Date()).day ?? 0
+                if daysSinceModified > cacheExpirationDays {
+                    try FileManager.default.removeItem(at: cacheFile)
+                    print("🎤 Cache file expired and removed: \(cacheKey)")
+                    return nil
+                }
+            }
+        } catch {
+            print("❌ Failed to check cache file attributes: \(error.localizedDescription)")
+            return nil
+        }
+        
+        do {
+            let data = try Data(contentsOf: cacheFile)
+            print("🎤 Cache hit: \(cacheKey) (\(data.count) bytes)")
+            return data
+        } catch {
+            print("❌ Failed to read cached voice: \(error.localizedDescription)")
+            return nil
+        }
+    }
+    
+    private func cacheVoice(text: String, data: Data) {
+        let cacheKey = getCacheKey(for: text)
+        let cacheFile = cacheDirectory.appendingPathComponent("\(cacheKey).mp3")
+        
+        do {
+            try data.write(to: cacheFile)
+            print("🎤 Voice cached: \(cacheKey) (\(data.count) bytes)")
+            
+            // Check cache size and clean up if necessary
+            if getCacheSize() > maxCacheSize {
+                cleanupOldCacheFiles()
+            }
+        } catch {
+            print("❌ Failed to cache voice: \(error.localizedDescription)")
+        }
+    }
+    
+    private func getCacheSize() -> Int64 {
+        do {
+            let fileManager = FileManager.default
+            let contents = try fileManager.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: [.fileSizeKey])
+            
+            var totalSize: Int64 = 0
+            for url in contents {
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+                if let fileSize = attributes[FileAttributeKey.size] as? Int64 {
+                    totalSize += fileSize
+                }
+            }
+            return totalSize
+        } catch {
+            print("❌ Failed to calculate cache size: \(error.localizedDescription)")
+            return 0
+        }
+    }
+    
+    private func cleanupExpiredCache() {
+        do {
+            let fileManager = FileManager.default
+            let contents = try fileManager.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: [.contentModificationDateKey])
+            
+            let cutoffDate = Calendar.current.date(byAdding: .day, value: -cacheExpirationDays, to: Date()) ?? Date()
+            
+            for url in contents {
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+                if let modificationDate = attributes[FileAttributeKey.modificationDate] as? Date,
+                   modificationDate < cutoffDate {
+                    try fileManager.removeItem(at: url)
+                    print("🎤 Removed expired cache file: \(url.lastPathComponent)")
+                }
+            }
+        } catch {
+            print("❌ Failed to cleanup expired cache: \(error.localizedDescription)")
+        }
+    }
+    
+    private func cleanupOldCacheFiles() {
+        do {
+            let fileManager = FileManager.default
+            let contents = try fileManager.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])
+            
+            // Sort by modification date (oldest first)
+            let sortedFiles = contents.sorted { url1, url2 in
+                let date1 = (try? fileManager.attributesOfItem(atPath: url1.path)[FileAttributeKey.modificationDate] as? Date) ?? Date.distantPast
+                let date2 = (try? fileManager.attributesOfItem(atPath: url2.path)[FileAttributeKey.modificationDate] as? Date) ?? Date.distantPast
+                return date1 < date2
+            }
+            
+            var currentSize = getCacheSize()
+            let targetSize = maxCacheSize * 3 / 4 // Keep cache at 75% of max size
+            
+            for url in sortedFiles {
+                if currentSize <= targetSize {
+                    break
+                }
+                
+                let attributes = try fileManager.attributesOfItem(atPath: url.path)
+                if let fileSize = attributes[FileAttributeKey.size] as? Int64 {
+                    try fileManager.removeItem(at: url)
+                    currentSize -= fileSize
+                    print("🎤 Removed old cache file: \(url.lastPathComponent)")
+                }
+            }
+        } catch {
+            print("❌ Failed to cleanup old cache files: \(error.localizedDescription)")
+        }
     }
 }
 

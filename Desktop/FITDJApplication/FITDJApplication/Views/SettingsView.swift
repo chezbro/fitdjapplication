@@ -16,12 +16,19 @@ struct SettingsView: View {
     @EnvironmentObject var streakService: StreakService
     @StateObject private var spotifyManager = SpotifyManager()
     @StateObject private var progressService = ProgressTrackingService()
+    @StateObject private var workoutMusicManager: WorkoutMusicManager
     
     @State private var showingSpotifyConnect = false
     @State private var showingSubscriptionManagement = false
     @State private var showingProgressDetails = false
     @State private var showingSignOutAlert = false
     @State private var showingReminderSettings = false
+    
+    init() {
+        let spotifyManager = SpotifyManager()
+        _spotifyManager = StateObject(wrappedValue: spotifyManager)
+        _workoutMusicManager = StateObject(wrappedValue: WorkoutMusicManager(spotifyManager: spotifyManager))
+    }
     
     var body: some View {
         NavigationView {
@@ -47,7 +54,18 @@ struct SettingsView: View {
                         PlaylistConfigurationSection()
                     }
                     
-                    SoundCloudSection()
+                }
+                
+                // Audio Controls Section
+                Section("Audio Controls") {
+                    AudioControlsSection(
+                        workoutMusicManager: workoutMusicManager
+                    )
+                }
+                
+                // Voice Management Section
+                Section("Voice Settings") {
+                    VoiceManagementSection()
                 }
                 
                 // Subscription Section
@@ -1131,90 +1149,501 @@ struct PlaylistConfigurationSection: View {
     }
 }
 
-// MARK: - SoundCloud Section
-struct SoundCloudSection: View {
-    @State private var showingSoundCloudURL = false
-    @State private var showingSoundCloudTracks = false
-    @State private var soundCloudTracks: [SoundCloudTrack] = []
+// MARK: - Audio Controls Section
+struct AudioControlsSection: View {
+    @ObservedObject var workoutMusicManager: WorkoutMusicManager
+    @StateObject private var voiceManager = VoiceManager()
+    @AppStorage("voiceVolume") private var storedVoiceVolume: Double = 1.0
+    @AppStorage("musicVolume") private var storedMusicVolume: Double = 1.0
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "music.note.house")
-                    .foregroundColor(.orange)
-                    .font(.title2)
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("SoundCloud Tracks")
-                        .font(.headline)
-                        .fontWeight(.medium)
+        VStack(spacing: 0) {
+            // Voice Volume Control
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "speaker.wave.2.fill")
+                        .foregroundColor(.blue)
+                        .font(.title2)
                     
-                    Text("Add SoundCloud songs to your workout playlist")
-                        .font(.subheadline)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Trainer Voice Volume")
+                            .font(.headline)
+                            .fontWeight(.medium)
+                        
+                        Text("Adjust the volume of the AI trainer's voice")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                HStack {
+                    Image(systemName: "speaker.fill")
                         .foregroundColor(.secondary)
+                        .font(.caption)
+                    
+                    Slider(value: $storedVoiceVolume, in: 0.0...1.0, step: 0.1) {
+                        Text("Voice Volume")
+                    } onEditingChanged: { editing in
+                        if !editing {
+                            // Update voice volume when slider is released
+                            voiceManager.voiceVolume = Float(storedVoiceVolume)
+                        }
+                    }
+                    .accentColor(.blue)
+                    
+                    Image(systemName: "speaker.wave.3.fill")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                }
+                
+                Text("Volume: \(Int(storedVoiceVolume * 100))%")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.vertical, 8)
+            
+            Divider()
+            
+            // Music Volume Control
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "music.note")
+                        .foregroundColor(.green)
+                        .font(.title2)
+                    
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Spotify Music Volume")
+                            .font(.headline)
+                            .fontWeight(.medium)
+                        
+                        Text("Adjust the volume of workout music")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                HStack {
+                    Image(systemName: "speaker.fill")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                    
+                    Slider(value: $storedMusicVolume, in: 0.0...1.0, step: 0.1) {
+                        Text("Music Volume")
+                    } onEditingChanged: { editing in
+                        if !editing {
+                            // Update music volume when slider is released
+                            workoutMusicManager.setUserMusicVolume(Float(storedMusicVolume))
+                        }
+                    }
+                    .accentColor(.green)
+                    
+                    Image(systemName: "speaker.wave.3.fill")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                }
+                
+                Text("Volume: \(Int(storedMusicVolume * 100))%")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.vertical, 8)
+        }
+        .onAppear {
+            // Initialize voice volume from stored value
+            voiceManager.voiceVolume = Float(storedVoiceVolume)
+            
+            // Initialize music volume from stored value
+            workoutMusicManager.userMusicVolume = Float(storedMusicVolume)
+        }
+        .onChange(of: storedVoiceVolume) { _, newValue in
+            // Update voice volume immediately as user drags slider
+            voiceManager.voiceVolume = Float(newValue)
+        }
+        .onChange(of: storedMusicVolume) { _, newValue in
+            // Update music volume immediately as user drags slider
+            workoutMusicManager.setUserMusicVolume(Float(newValue))
+        }
+    }
+}
+
+// MARK: - Voice Management Section
+struct VoiceManagementSection: View {
+    @StateObject private var voiceManager = VoiceManager()
+    @State private var showingVoiceSettings = false
+    @State private var showingCacheDetails = false
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Voice Provider Selection
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "waveform")
+                        .foregroundColor(.purple)
+                        .font(.title2)
+                    
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Voice Provider")
+                            .font(.headline)
+                            .fontWeight(.medium)
+                        
+                        Text(voiceManager.useElevenLabs ? "ElevenLabs AI Voice" : "System Voice")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Spacer()
+                    
+                    Button("Settings") {
+                        showingVoiceSettings = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                
+                // Credits and Cache Info
+                if voiceManager.useElevenLabs {
+                    HStack(spacing: 20) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Credits Remaining")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Text("\(voiceManager.elevenLabsCreditsRemaining)")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(voiceManager.elevenLabsCreditsRemaining > 100 ? .green : .orange)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Cache Hits")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Text("\(voiceManager.cacheHitCount)")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.blue)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Cache Misses")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Text("\(voiceManager.cacheMissCount)")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                        }
+                        
+                        Spacer()
+                        
+                        Button("Cache Details") {
+                            showingCacheDetails = true
+                        }
+                        .font(.caption)
+                        .foregroundColor(.accentColor)
+                    }
+                    .padding(.top, 8)
+                }
+            }
+            .padding(.vertical, 8)
+        }
+        .sheet(isPresented: $showingVoiceSettings) {
+            VoiceSettingsView(voiceManager: voiceManager)
+        }
+        .sheet(isPresented: $showingCacheDetails) {
+            VoiceCacheDetailsView(voiceManager: voiceManager)
+        }
+    }
+}
+
+// MARK: - Voice Settings View
+struct VoiceSettingsView: View {
+    @ObservedObject var voiceManager: VoiceManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var tempCredits: String = ""
+    @State private var showingCreditsAlert = false
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 20) {
+                // Voice Provider Selection
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Voice Provider")
+                        .font(.headline)
+                        .fontWeight(.semibold)
+                    
+                    VStack(spacing: 12) {
+                        // ElevenLabs Option
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("ElevenLabs AI Voice")
+                                    .font(.headline)
+                                    .fontWeight(.medium)
+                                
+                                Text("High-quality AI voice with natural speech")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Spacer()
+                            
+                            Toggle("", isOn: $voiceManager.useElevenLabs)
+                                .labelsHidden()
+                        }
+                        .padding()
+                        .background(Color(.systemGray6))
+                        .cornerRadius(12)
+                        
+                        // System Voice Option
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("System Voice")
+                                    .font(.headline)
+                                    .fontWeight(.medium)
+                                
+                                Text("Built-in iOS text-to-speech (always available)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Spacer()
+                            
+                            Toggle("", isOn: Binding(
+                                get: { !voiceManager.useElevenLabs },
+                                set: { voiceManager.useElevenLabs = !$0 }
+                            ))
+                            .labelsHidden()
+                        }
+                        .padding()
+                        .background(Color(.systemGray6))
+                        .cornerRadius(12)
+                    }
+                }
+                
+                // ElevenLabs Settings
+                if voiceManager.useElevenLabs {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("ElevenLabs Settings")
+                            .font(.headline)
+                            .fontWeight(.semibold)
+                        
+                        // Credits Management
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Credits Remaining: \(voiceManager.elevenLabsCreditsRemaining)")
+                                .font(.subheadline)
+                                .foregroundColor(voiceManager.elevenLabsCreditsRemaining > 100 ? .green : .orange)
+                            
+                            HStack {
+                                TextField("Set credits", text: $tempCredits)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                
+                                Button("Update") {
+                                    if let credits = Int(tempCredits) {
+                                        voiceManager.setElevenLabsCredits(credits)
+                                        tempCredits = ""
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(tempCredits.isEmpty)
+                            }
+                        }
+                        
+                        // Cache Statistics
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Cache Statistics")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            
+                            HStack(spacing: 20) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Cache Hits")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    
+                                    Text("\(voiceManager.cacheHitCount)")
+                                        .font(.headline)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.blue)
+                                }
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Cache Misses")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    
+                                    Text("\(voiceManager.cacheMissCount)")
+                                        .font(.headline)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.orange)
+                                }
+                                
+                                Spacer()
+                                
+                                Button("Clear Cache") {
+                                    voiceManager.clearCache()
+                                }
+                                .buttonStyle(.bordered)
+                                .foregroundColor(.red)
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(Color(.systemGray6))
+                    .cornerRadius(12)
                 }
                 
                 Spacer()
             }
-            
-            HStack(spacing: 12) {
-                Button("Add SoundCloud URL") {
-                    showingSoundCloudURL = true
+            .padding()
+            .navigationTitle("Voice Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                
-                Button("View Tracks (\(soundCloudTracks.count))") {
-                    showingSoundCloudTracks = true
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(soundCloudTracks.isEmpty)
             }
-            .padding(.top, 8)
         }
-        .padding(.vertical, 4)
-        .onAppear {
-            loadSoundCloudTracks()
-        }
-        .sheet(isPresented: $showingSoundCloudURL) {
-            SoundCloudURLView(
-                onURLAdded: { url in
-                    addSoundCloudURL(url)
-                },
-                onCancel: {
-                    showingSoundCloudURL = false
-                }
-            )
-        }
-        .sheet(isPresented: $showingSoundCloudTracks) {
-            SoundCloudTrackListView(
-                onTrackRemoved: { trackID in
-                    removeSoundCloudTrack(trackID)
-                }
-            )
-        }
-    }
-    
-    private func loadSoundCloudTracks() {
-        // This would typically come from your WorkoutMusicManager
-        // For now, we'll show a placeholder
-        soundCloudTracks = []
-    }
-    
-    private func addSoundCloudURL(_ url: String) {
-        // This would typically call your WorkoutMusicManager
-        print("Adding SoundCloud URL: \(url)")
-        showingSoundCloudURL = false
-        loadSoundCloudTracks()
-    }
-    
-    private func removeSoundCloudTrack(_ trackID: String) {
-        // This would typically call your WorkoutMusicManager
-        print("Removing SoundCloud track: \(trackID)")
-        loadSoundCloudTracks()
     }
 }
+
+// MARK: - Voice Cache Details View
+struct VoiceCacheDetailsView: View {
+    @ObservedObject var voiceManager: VoiceManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var cacheSize: Int64 = 0
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 20) {
+                // Cache Overview
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Cache Overview")
+                        .font(.headline)
+                        .fontWeight(.semibold)
+                    
+                    HStack(spacing: 20) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Cache Size")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            
+                            Text(formatBytes(cacheSize))
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Cache Hits")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            
+                            Text("\(voiceManager.cacheHitCount)")
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.blue)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Cache Misses")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            
+                            Text("\(voiceManager.cacheMissCount)")
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                        }
+                        
+                        Spacer()
+                    }
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(12)
+                
+                // Cache Efficiency
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Cache Efficiency")
+                        .font(.headline)
+                        .fontWeight(.semibold)
+                    
+                    let totalRequests = voiceManager.cacheHitCount + voiceManager.cacheMissCount
+                    let hitRate = totalRequests > 0 ? Double(voiceManager.cacheHitCount) / Double(totalRequests) : 0.0
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Hit Rate")
+                                .font(.subheadline)
+                            
+                            Spacer()
+                            
+                            Text("\(Int(hitRate * 100))%")
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                                .foregroundColor(hitRate > 0.5 ? .green : .orange)
+                        }
+                        
+                        ProgressView(value: hitRate)
+                            .progressViewStyle(LinearProgressViewStyle(tint: hitRate > 0.5 ? .green : .orange))
+                    }
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(12)
+                
+                // Cache Actions
+                VStack(spacing: 12) {
+                    Button("Clear Cache") {
+                        voiceManager.clearCache()
+                        cacheSize = 0
+                    }
+                    .buttonStyle(.bordered)
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity)
+                    
+                    Button("Test Voice") {
+                        voiceManager.speakText("This is a test of the voice system.")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: .infinity)
+                }
+                
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Cache Details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                // Calculate cache size (this would need to be implemented in VoiceManager)
+                cacheSize = 0 // Placeholder - would need actual implementation
+            }
+        }
+    }
+    
+    private func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+}
+
 
 #Preview {
     SettingsView()

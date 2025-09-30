@@ -154,8 +154,13 @@ FITDJ is a workout app for iPhone. It gives people a personal trainer who talks 
 SPOTIFY_CLIENT_ID=e565d85fc0e04aba9093b17589b5e1e3
 SPOTIFY_CLIENT_SECRET=181ab31b7ee84e63a8fde0f27ec44a5b
 SPOTIFY_REDIRECT_URI=fitdj://spotify-auth-callback
-ELEVENLABS_API_KEY=sk_af34df5101d4e23cf1b8137164cf638a7a5b643674d0eedd
+ELEVENLABS_API_KEY=sk_8897ac346a30c272330d29230fd2c327918acc4870da52e8
 
 ELEVENLABS_VOICE_ID=egTToTzW6GojvddLj0zd
 
+## Backup Environment Variables
+
+ELEVENLABS_API_KEY=sk_af34df5101d4e23cf1b8137164cf638a7a5b643674d0eedd
+
+ELEVENLABS_VOICE_ID=egTToTzW6GojvddLj0zd
 ---

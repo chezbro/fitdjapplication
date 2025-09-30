@@ -115,6 +115,7 @@ enum VoiceCueType: String, CaseIterable, Codable {
     case motivation = "motivation"
     case rest = "rest"
     case transition = "transition"
+    case exercise_description = "exercise_description"
 }
 
 enum WorkoutIntensity: String, CaseIterable, Codable {
@@ -144,3 +145,4 @@ enum WorkoutIntensity: String, CaseIterable, Codable {
         }
     }
 }
+

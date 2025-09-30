@@ -10,10 +10,16 @@ import Combine
 #if canImport(AVFoundation)
 import AVFoundation
 #endif
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(WebKit)
+import WebKit
+#endif
 
 // F-004 & F-006: Music management with ducking for trainer voice
 @MainActor
-class WorkoutMusicManager: NSObject, ObservableObject {
+class WorkoutMusicManager: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var isPlaying = false
     @Published var isPaused = false
     @Published var currentTrack: SpotifyTrack?
@@ -21,16 +27,21 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     @Published var errorMessage: String?
     
     private let spotifyManager: SpotifyManager
-    private let soundCloudManager: SoundCloudManager
-#if canImport(AVFoundation)
+#if canImport(AVFoundation) && !targetEnvironment(macCatalyst)
     private var audioSession = AVAudioSession.sharedInstance()
 #endif
     private var cancellables = Set<AnyCancellable>()
     
     // Music ducking settings
     private let normalVolume: Float = 0.7
-    private let duckedVolume: Float = 0.2
+    private let duckedVolume: Float = 0.15  // Quiet but audible when trainer is speaking
     private var isDucked = false
+    
+    // User-controlled volume settings
+    @Published var userMusicVolume: Float = 1.0 // User-controlled music volume multiplier (0.0 to 1.0)
+    
+    // Track current cue for volume recalculation
+    private var currentCue: VoiceCue?
     
     // Fade animation settings
     private var fadeTimer: Timer?
@@ -45,9 +56,14 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     private let backgroundQueue = DispatchQueue(label: "workout.music.background", qos: .userInitiated)
     private var pendingRequests = Set<String>() // Track pending requests to avoid duplicates
     
+    // Network error handling
+    private let maxRetryAttempts = 3
+    private let retryDelay: TimeInterval = 2.0
+    private var retryCount: [String: Int] = [:]
+    
+    
     init(spotifyManager: SpotifyManager) {
         self.spotifyManager = spotifyManager
-        self.soundCloudManager = SoundCloudManager()
         super.init()
         setupAudioSession()
         setupVolumeObserver()
@@ -64,21 +80,31 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         deviceCache.removeAll()
         activeDeviceID = nil
         lastDeviceCheck = nil
+        
+        // Clear retry counts
+        retryCount.removeAll()
+        
     }
     
     // MARK: - Public Methods
     
     func startWorkoutMusic(for workout: Workout, userPreference: MusicPreference) {
+        print("🎵 ===== STARTING WORKOUT MUSIC =====")
         print("🎵 Starting workout music for: \(workout.title)")
+        print("🎵 User preference: \(userPreference)")
         
         // Add a small delay to ensure Spotify manager is fully initialized
         // and to allow voice system to set up first
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self = self else { 
+                print("❌ WorkoutMusicManager deallocated during initialization")
+                return 
+            }
             
+            // Check if Spotify is connected
             guard self.spotifyManager.isConnected else {
                 print("🎵 Spotify not connected. Workout will continue without music.")
-                self.errorMessage = "Spotify not connected. Workout will continue without music."
+                self.errorMessage = "No music available. Connect to Spotify to play music during workouts."
                 self.isPlaying = false
                 self.isPaused = false
                 return
@@ -96,7 +122,7 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             self.configureAudioSessionForMusic()
             
             let energyLevel = self.getEnergyLevel(for: workout, userPreference: userPreference)
-            print("🎵 Playing playlist for energy level: \(energyLevel)")
+            print("🎵 Playing Spotify playlist for energy level: \(energyLevel)")
             self.playWorkoutPlaylist(energyLevel: energyLevel)
         }
     }
@@ -150,33 +176,45 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     private func duckMusicForVoice(cueType: String, cueText: String) {
         guard !isDucked else { return }
         
-        // Adjust ducking based on cue type
+        // Store current cue for volume recalculation
+        currentCue = VoiceCue(id: "current", text: cueText, timing: 0, type: VoiceCueType(rawValue: cueType) ?? .instruction)
+        
+        // Adjust ducking based on cue type with more nuanced control
         let targetVolume: Float
         let fadeSpeed: TimeInterval
         
         switch cueType {
         case "instruction":
-            // Instructions need more ducking for clarity
-            targetVolume = duckedVolume * 0.7 // Even lower for instructions
-            fadeSpeed = 0.3 // Faster fade for instructions
+            // Instructions need heavy ducking for clarity - these are critical
+            targetVolume = (duckedVolume * 0.4) * userMusicVolume // Apply user volume multiplier
+            fadeSpeed = 0.25 // Faster fade for instructions
         case "countdown":
-            // Countdowns need moderate ducking
-            targetVolume = duckedVolume
-            fadeSpeed = 0.4
+            // Countdowns need moderate ducking but should be clear
+            targetVolume = (duckedVolume * 0.6) * userMusicVolume // Apply user volume multiplier
+            fadeSpeed = 0.3
         case "motivation":
-            // Motivational cues can have less ducking
-            targetVolume = duckedVolume * 1.2
-            fadeSpeed = 0.5
+            // Motivational cues can have less ducking to maintain energy
+            targetVolume = (duckedVolume * 1.5) * userMusicVolume // Apply user volume multiplier
+            fadeSpeed = 0.4
         case "transition":
             // Transitions need moderate ducking
-            targetVolume = duckedVolume
+            targetVolume = (duckedVolume * 0.7) * userMusicVolume // Apply user volume multiplier
+            fadeSpeed = 0.35
+        case "rest":
+            // During rest, music can be louder for motivation
+            targetVolume = (duckedVolume * 2.0) * userMusicVolume // Apply user volume multiplier
+            fadeSpeed = 0.5
+        case "exercise_description":
+            // Exercise descriptions need clear audio but music can stay energetic
+            targetVolume = (duckedVolume * 0.8) * userMusicVolume // Apply user volume multiplier
             fadeSpeed = 0.4
         default:
-            targetVolume = duckedVolume
+            targetVolume = duckedVolume * userMusicVolume // Apply user volume multiplier
             fadeSpeed = 0.5
         }
         
         print("🎵 Ducking for \(cueType): volume=\(targetVolume), speed=\(fadeSpeed)s")
+        print("🎵 Current volume: \(volume), Target volume: \(targetVolume)")
         isDucked = true
         
         // Use custom fade speed for this ducking
@@ -187,10 +225,18 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         guard isDucked else { return }
         
         print("🎵 Unducking music after voice")
+        print("🎵 Current volume: \(volume), Target volume: \(normalVolume * userMusicVolume)")
         isDucked = false
+        currentCue = nil // Clear current cue
         
-        // Slightly slower fade back to normal volume for smoother transition
-        fadeToVolumeWithSpeed(normalVolume, duration: 0.8)
+        // Add a longer delay to ensure voice has completely finished before unducking
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self = self else { return }
+            // Check if we're still not ducked (in case another voice cue started)
+            guard !self.isDucked else { return }
+            // Slower fade back to normal volume for smoother transition (with user volume multiplier)
+            self.fadeToVolumeWithSpeed(self.normalVolume * self.userMusicVolume, duration: 1.2)
+        }
     }
     
     func adjustIntensity(easier: Bool, currentWorkout: Workout) {
@@ -208,48 +254,60 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         print("🎵 Custom playlist ID cleared")
     }
     
-    // MARK: - SoundCloud Methods
-    
-    func addSoundCloudURL(_ urlString: String) -> Bool {
-        guard soundCloudManager.validateSoundCloudURL(urlString) else {
-            errorMessage = "Invalid SoundCloud URL. Please provide a valid SoundCloud link."
-            return false
-        }
+    func setUserMusicVolume(_ volume: Float) {
+        userMusicVolume = max(0.0, min(1.0, volume)) // Clamp between 0.0 and 1.0
+        print("🎵 User music volume set to: \(userMusicVolume)")
         
-        guard let track = soundCloudManager.parseSoundCloudURL(urlString) else {
-            errorMessage = "Failed to parse SoundCloud URL. Please check the link and try again."
-            return false
-        }
-        
-        soundCloudManager.addSoundCloudTrackToPlaylist(track, playlistID: "soundcloud_playlist")
-        print("🎵 Added SoundCloud track: \(track.title)")
-        return true
-    }
-    
-    func getSoundCloudTracks() -> [SoundCloudTrack] {
-        return soundCloudManager.getStoredSoundCloudTracks()
-    }
-    
-    func removeSoundCloudTrack(_ trackID: String) {
-        soundCloudManager.removeSoundCloudTrack(trackID)
-    }
-    
-    func clearSoundCloudTracks() {
-        soundCloudManager.clearAllSoundCloudTracks()
-    }
-    
-    func parseSoundCloudURLFromText(_ text: String) -> [SoundCloudTrack] {
-        let urls = soundCloudManager.extractAllSoundCloudURLs(from: text)
-        var tracks: [SoundCloudTrack] = []
-        
-        for url in urls {
-            if let track = soundCloudManager.parseSoundCloudURL(url) {
-                tracks.append(track)
+        // If music is currently playing, apply the new volume immediately
+        if isPlaying && !isPaused {
+            if isDucked {
+                // If currently ducked, recalculate ducked volume with new user volume
+                let currentCueType = currentCue?.type.rawValue ?? "default"
+                duckMusicForVoice(cueType: currentCueType, cueText: currentCue?.text ?? "")
+            } else {
+                // If not ducked, apply normal volume with new user volume
+                fadeToVolumeWithSpeed(normalVolume * userMusicVolume, duration: 0.3)
             }
         }
-        
-        return tracks
     }
+    
+    // MARK: - Music Energy Synchronization
+    
+    func syncMusicWithExercisePhase(phase: ExercisePhase) {
+        guard isPlaying && !isPaused else { return }
+        
+        let energyMultiplier: Float
+        let volumeMultiplier: Float
+        
+        switch phase {
+        case .preparation:
+            // Lower energy during preparation to not overwhelm
+            energyMultiplier = 0.8
+            volumeMultiplier = 0.9
+        case .exercise:
+            // Full energy during exercise for motivation
+            energyMultiplier = 1.0
+            volumeMultiplier = 1.0
+        case .rest:
+            // Slightly lower energy during rest but still motivating
+            energyMultiplier = 0.9
+            volumeMultiplier = 1.1
+        case .transition:
+            // Medium energy during transitions
+            energyMultiplier = 0.85
+            volumeMultiplier = 0.95
+        }
+        
+        // Adjust music volume based on phase (only if not ducked)
+        if !isDucked {
+            let targetVolume = (normalVolume * userMusicVolume * volumeMultiplier)
+            fadeToVolumeWithSpeed(targetVolume, duration: 1.0)
+        }
+        
+        print("🎵 Music synced with exercise phase: \(phase) - energy: \(energyMultiplier), volume: \(volumeMultiplier)")
+    }
+    
+    
     
     func checkSpotifySetup() -> String {
         guard spotifyManager.isConnected else {
@@ -269,58 +327,32 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             return
         }
         
-        // Prevent duplicate search requests
-        let requestKey = "search_playlists"
-        if pendingRequests.contains(requestKey) {
-            print("🎵 Search request already in progress, skipping duplicate")
-            return
-        }
-        pendingRequests.insert(requestKey)
-        
         // Search for workout playlists with optimized query
         let query = "workout fitness"
         guard let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "https://api.spotify.com/v1/search?q=\(encodedQuery)&type=playlist&limit=20") else {
-            pendingRequests.remove(requestKey)
             completion([])
             return
         }
         
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 10.0
-        
-        // Move search to background queue
-        backgroundQueue.async {
-            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-                DispatchQueue.main.async {
-                    guard let strongSelf = self else {
-                        completion([])
-                        return
-                    }
-                    
-                    strongSelf.pendingRequests.remove(requestKey)
-                    
-                    if let error = error {
-                        print("🎵 Error searching playlists: \(error.localizedDescription)")
-                        completion([])
-                        return
-                    }
-                    
-                    guard let data = data else {
-                        completion([])
-                        return
-                    }
-                    
-                    do {
-                        let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
-                        completion(searchResponse.playlists.items)
-                    } catch {
-                        print("🎵 Failed to parse search response: \(error.localizedDescription)")
-                        completion([])
-                    }
+        makeNetworkRequest(
+            url: url,
+            requestType: "search_playlists",
+            accessToken: accessToken
+        ) { result in
+            switch result {
+            case .success(let data):
+                do {
+                    let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
+                    completion(searchResponse.playlists.items)
+                } catch {
+                    print("🎵 Failed to parse search response: \(error.localizedDescription)")
+                    completion([])
                 }
-            }.resume()
+            case .failure(let error):
+                print("🎵 Error searching playlists: \(error.localizedDescription)")
+                completion([])
+            }
         }
     }
     
@@ -350,7 +382,7 @@ class WorkoutMusicManager: NSObject, ObservableObject {
         
         var currentStep = 0
         fadeTimer = Timer.scheduledTimer(withTimeInterval: timeStep, repeats: true) { [weak self] timer in
-            guard let self = self else {
+            guard let strongSelf = self else {
                 timer.invalidate()
                 return
             }
@@ -362,30 +394,30 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             let clampedVolume = max(0.0, min(1.0, newVolume))
             
             // Only update volume every few steps to reduce API calls during fade
-            if currentStep % 3 == 0 || currentStep >= self.fadeSteps {
-                print("🎵 Fade step \(currentStep)/\(self.fadeSteps): volume = \(clampedVolume)")
+            if currentStep % 3 == 0 || currentStep >= strongSelf.fadeSteps {
+                print("🎵 Fade step \(currentStep)/\(strongSelf.fadeSteps): volume = \(clampedVolume)")
                 
                 // Update local volume and Spotify volume on main thread
                 Task { @MainActor in
-                    self.volume = clampedVolume
-                    self.setSpotifyVolume(clampedVolume)
+                    strongSelf.volume = clampedVolume
+                    strongSelf.setSpotifyVolumeDirectly(clampedVolume)
                 }
             } else {
                 // Update local volume without API call for intermediate steps
                 Task { @MainActor in
-                    self.volume = clampedVolume
+                    strongSelf.volume = clampedVolume
                 }
             }
             
             // Check if we've reached the target or completed all steps
-            if currentStep >= self.fadeSteps || abs(clampedVolume - targetVolume) < 0.01 {
+            if currentStep >= strongSelf.fadeSteps || abs(clampedVolume - targetVolume) < 0.01 {
                 // Ensure we end exactly at target volume
                 Task { @MainActor in
-                    self.volume = targetVolume
-                    self.setSpotifyVolume(targetVolume)
+                    strongSelf.volume = targetVolume
+                    strongSelf.setSpotifyVolumeDirectly(targetVolume)
                     print("🎵 Fade complete: final volume = \(targetVolume)")
-                    timer.invalidate()
-                    self.fadeTimer = nil
+                    strongSelf.fadeTimer?.invalidate()
+                    strongSelf.fadeTimer = nil
                 }
             }
         }
@@ -393,23 +425,149 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     
     // MARK: - Private Methods
     
+    private func checkNetworkConnectivity() -> Bool {
+        // Check if we have network connectivity
+        guard let url = URL(string: "https://api.spotify.com") else { return false }
+        
+        var isConnected = false
+        let semaphore = DispatchSemaphore(value: 0)
+        
+        let task = URLSession.shared.dataTask(with: url) { _, response, error in
+            if let httpResponse = response as? HTTPURLResponse {
+                isConnected = httpResponse.statusCode < 500 // Any response under 500 means we can reach the server
+            } else if error == nil {
+                isConnected = true
+            }
+            semaphore.signal()
+        }
+        
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 5.0) // 5 second timeout
+        
+        return isConnected
+    }
+    
+    private func makeNetworkRequest(
+        url: URL,
+        requestType: String,
+        accessToken: String,
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        // Check network connectivity first
+        guard checkNetworkConnectivity() else {
+            print("🎵 No network connectivity for \(requestType)")
+            completion(.failure(NetworkError.noConnectivity))
+            return
+        }
+        
+        // Prevent duplicate requests
+        if pendingRequests.contains(requestType) {
+            print("🎵 Request already in progress for \(requestType)")
+            return
+        }
+        pendingRequests.insert(requestType)
+        
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15.0
+        
+        // Add retry logic
+        let retryKey = "\(requestType)_\(url.absoluteString)"
+        let currentRetryCount = retryCount[retryKey] ?? 0
+        
+        if currentRetryCount >= maxRetryAttempts {
+            print("🎵 Max retry attempts reached for \(requestType)")
+            pendingRequests.remove(requestType)
+            completion(.failure(NetworkError.maxRetriesReached))
+            return
+        }
+        
+        backgroundQueue.async {
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                DispatchQueue.main.async {
+                    guard let strongSelf = self else {
+                        completion(.failure(NetworkError.unknown))
+                        return
+                    }
+                    
+                    strongSelf.pendingRequests.remove(requestType)
+                    
+                    if let error = error {
+                        print("🎵 Network error for \(requestType): \(error.localizedDescription)")
+                        
+                        // Check if this is a retryable error
+                        if strongSelf.isRetryableError(error) && currentRetryCount < strongSelf.maxRetryAttempts {
+                            print("🎵 Retrying \(requestType) (attempt \(currentRetryCount + 1)/\(strongSelf.maxRetryAttempts))")
+                            strongSelf.retryCount[retryKey] = currentRetryCount + 1
+                            
+                            DispatchQueue.main.asyncAfter(deadline: .now() + strongSelf.retryDelay) {
+                                strongSelf.makeNetworkRequest(
+                                    url: url,
+                                    requestType: requestType,
+                                    accessToken: accessToken,
+                                    completion: completion
+                                )
+                            }
+                            return
+                        }
+                        
+                        completion(.failure(error))
+                        return
+                    }
+                    
+                    guard let data = data else {
+                        completion(.failure(NetworkError.noData))
+                        return
+                    }
+                    
+                    // Reset retry count on success
+                    strongSelf.retryCount.removeValue(forKey: retryKey)
+                    completion(.success(data))
+                }
+            }.resume()
+        }
+    }
+    
+    private func isRetryableError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .networkConnectionLost, .notConnectedToInternet, .timedOut, .cannotConnectToHost:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
+    }
+    
     private func setupAudioSession() {
-#if canImport(AVFoundation)
-        do {
-            // Set up audio session that works well with voice system
-            // Use playAndRecord to allow both music and voice
-            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP, .defaultToSpeaker])
-            try audioSession.setActive(true)
-            print("🎵 Music audio session configured to work with voice system")
-        } catch {
-            print("❌ Music audio session setup failed: \(error.localizedDescription)")
-            errorMessage = "Failed to setup audio session: \(error.localizedDescription)"
+#if canImport(AVFoundation) && !targetEnvironment(macCatalyst)
+        // Add a small delay to avoid conflicts with VoiceManager
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            
+            do {
+                // Check if audio session is already configured by VoiceManager
+                if self.audioSession.category == .playAndRecord {
+                    print("🎵 Audio session already configured by VoiceManager")
+                    return
+                }
+                
+                // Set up audio session that works well with voice system
+                // Use playAndRecord to allow both music and voice
+                try self.audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .allowAirPlay, .allowBluetoothHFP, .defaultToSpeaker])
+                try self.audioSession.setActive(true)
+                print("🎵 Music audio session configured to work with voice system")
+            } catch {
+                print("❌ Music audio session setup failed: \(error.localizedDescription)")
+                self.errorMessage = "Failed to setup audio session: \(error.localizedDescription)"
+            }
         }
 #endif
     }
     
     private func configureAudioSessionForMusic() {
-#if canImport(AVFoundation)
+#if canImport(AVFoundation) && !targetEnvironment(macCatalyst)
         do {
             // Configure audio session to work with voice system
             // Use the same category as voice system to avoid conflicts
@@ -568,50 +726,25 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             return
         }
         
-        // Prevent duplicate requests
-        let requestKey = "device_check_\(accessToken.prefix(10))"
-        if pendingRequests.contains(requestKey) {
-            print("🎵 Device check already in progress, skipping duplicate request")
-            return
-        }
-        pendingRequests.insert(requestKey)
-        
         guard let url = URL(string: "https://api.spotify.com/v1/me/player/devices") else {
-            pendingRequests.remove(requestKey)
             completion(false)
             return
         }
         
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 10.0 // Add timeout
-        
-        // Move network request to background queue
-        backgroundQueue.async {
-            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-                DispatchQueue.main.async {
-                    guard let strongSelf = self else {
-                        completion(false)
-                        return
-                    }
-                    
-                    strongSelf.pendingRequests.remove(requestKey)
-                    
-                    if let error = error {
-                        print("🎵 Error checking devices: \(error.localizedDescription)")
-                        completion(false)
-                        return
-                    }
-                    
-                    guard let data = data else {
-                        print("🎵 No device data received")
-                        completion(false)
-                        return
-                    }
-                    
-                    do {
-                        let deviceResponse = try JSONDecoder().decode(SpotifyDevicesResponse.self, from: data)
-                        
+        makeNetworkRequest(
+            url: url,
+            requestType: "device_check_\(accessToken.prefix(10))",
+            accessToken: accessToken
+        ) { [weak self] result in
+            guard let strongSelf = self else {
+                completion(false)
+                return
+            }
+            
+            switch result {
+            case .success(let data):
+                do {
+                    let deviceResponse = try JSONDecoder().decode(SpotifyDevicesResponse.self, from: data)
                     // Update cache
                     strongSelf.deviceCache = deviceResponse.devices
                     strongSelf.lastDeviceCheck = Date()
@@ -633,12 +766,14 @@ class WorkoutMusicManager: NSObject, ObservableObject {
                     } else {
                         completion(hasActiveDevice)
                     }
-                    } catch {
-                        print("🎵 Failed to parse device response: \(error.localizedDescription)")
-                        completion(false)
-                    }
+                } catch {
+                    print("🎵 Failed to parse device response: \(error.localizedDescription)")
+                    completion(false)
                 }
-            }.resume()
+            case .failure(let error):
+                print("🎵 Error checking devices: \(error.localizedDescription)")
+                completion(false)
+            }
         }
     }
     
@@ -763,29 +898,29 @@ class WorkoutMusicManager: NSObject, ObservableObject {
                         if httpResponse.statusCode == 404 {
                             print("🎵 Playlist not found (404). Playlist ID: \(playlistID)")
                             // Try to verify the playlist exists by fetching its details
-                            self.verifyPlaylistExists(playlistID: playlistID, accessToken: accessToken)
+                            strongSelf.verifyPlaylistExists(playlistID: playlistID, accessToken: accessToken)
                             return
                         } else if httpResponse.statusCode == 403 {
                             print("🎵 Forbidden (403). Check if you have Spotify Premium and proper permissions.")
-                            self.errorMessage = "Access denied. Please ensure you have Spotify Premium and the playlist is accessible."
+                            strongSelf.errorMessage = "Access denied. Please ensure you have Spotify Premium and the playlist is accessible."
                             return
                         } else if httpResponse.statusCode == 401 {
                             print("🎵 Unauthorized (401). Token may be expired.")
-                            self.errorMessage = "Authentication failed. Please reconnect to Spotify."
+                            strongSelf.errorMessage = "Authentication failed. Please reconnect to Spotify."
                             // Try to refresh the token
-                            self.spotifyManager.refreshAccessToken()
+                            strongSelf.spotifyManager.refreshAccessToken()
                             return
                         } else if httpResponse.statusCode == 204 {
                             print("🎵 Music started successfully!")
-                            self.isPlaying = true
-                            self.isPaused = false
-                            self.errorMessage = nil
+                            strongSelf.isPlaying = true
+                            strongSelf.isPaused = false
+                            strongSelf.errorMessage = nil
                         } else {
                             print("🎵 Unexpected response code: \(httpResponse.statusCode)")
                             if let data = data, let responseString = String(data: data, encoding: .utf8) {
                                 print("🎵 Response body: \(responseString)")
                             }
-                            self.errorMessage = "Unexpected response from Spotify: \(httpResponse.statusCode)"
+                            strongSelf.errorMessage = "Unexpected response from Spotify: \(httpResponse.statusCode)"
                             return
                         }
                     }
@@ -921,7 +1056,7 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     private func transferPlaybackToActiveDevice(accessToken: String, completion: @escaping (Bool) -> Void) {
         // Get the device list first
         getDeviceList(accessToken: accessToken) { [weak self] deviceID in
-            guard let self = self, let deviceID = deviceID else {
+            guard let _ = self, let deviceID = deviceID else {
                 print("🎵 No active device found for transfer")
                 completion(false)
                 return
@@ -974,22 +1109,13 @@ class WorkoutMusicManager: NSObject, ObservableObject {
             return
         }
         
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            DispatchQueue.main.async {
-                if let error = error {
-                    print("🎵 Error getting device list: \(error.localizedDescription)")
-                    completion(nil)
-                    return
-                }
-                
-                guard let data = data else {
-                    completion(nil)
-                    return
-                }
-                
+        makeNetworkRequest(
+            url: url,
+            requestType: "get_device_list",
+            accessToken: accessToken
+        ) { result in
+            switch result {
+            case .success(let data):
                 do {
                     let deviceResponse = try JSONDecoder().decode(SpotifyDevicesResponse.self, from: data)
                     let activeDevice = deviceResponse.devices.first { $0.is_active }
@@ -998,126 +1124,88 @@ class WorkoutMusicManager: NSObject, ObservableObject {
                     print("🎵 Failed to parse device list: \(error.localizedDescription)")
                     completion(nil)
                 }
+            case .failure(let error):
+                print("🎵 Error getting device list: \(error.localizedDescription)")
+                completion(nil)
             }
-        }.resume()
+        }
     }
     
     private func findWorkingPlaylist(accessToken: String) {
         print("🎵 Searching for a working playlist...")
         
-        // Prevent duplicate requests
-        let requestKey = "find_working_playlist"
-        if pendingRequests.contains(requestKey) {
-            print("🎵 Find working playlist request already in progress")
-            return
-        }
-        pendingRequests.insert(requestKey)
-        
         // First try to get user's own playlists
         guard let url = URL(string: "https://api.spotify.com/v1/me/playlists?limit=20") else {
             self.errorMessage = "Failed to access your playlists. Please try reconnecting to Spotify."
-            pendingRequests.remove(requestKey)
             return
         }
         
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 10.0
-        
-        // Move to background queue
-        backgroundQueue.async {
-            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-                DispatchQueue.main.async {
-                    guard let strongSelf = self else { return }
-                    
-                    strongSelf.pendingRequests.remove(requestKey)
-                    
-                    if let error = error {
-                        print("🎵 Error getting user playlists: \(error.localizedDescription)")
-                        self.errorMessage = "Failed to get your playlists. Please try reconnecting to Spotify."
-                        return
+        makeNetworkRequest(
+            url: url,
+            requestType: "find_working_playlist",
+            accessToken: accessToken
+        ) { [weak self] result in
+            guard let strongSelf = self else { return }
+            
+            switch result {
+            case .success(let data):
+                do {
+                    let userPlaylists = try JSONDecoder().decode(SpotifyUserPlaylistsResponse.self, from: data)
+                    if let firstPlaylist = userPlaylists.items.first {
+                        print("🎵 Found user playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
+                        strongSelf.setCustomPlaylistID(firstPlaylist.id)
+                        strongSelf.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
+                    } else {
+                        print("🎵 No user playlists found, trying search...")
+                        strongSelf.searchForWorkingPlaylist(accessToken: accessToken)
                     }
-                    
-                    guard let data = data else {
-                        self.errorMessage = "No playlist data received. Please try reconnecting to Spotify."
-                        return
-                    }
-                    
-                    do {
-                        let userPlaylists = try JSONDecoder().decode(SpotifyUserPlaylistsResponse.self, from: data)
-                        if let firstPlaylist = userPlaylists.items.first {
-                            print("🎵 Found user playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
-                            self.setCustomPlaylistID(firstPlaylist.id)
-                            self.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
-                        } else {
-                            print("🎵 No user playlists found, trying search...")
-                            self.searchForWorkingPlaylist(accessToken: accessToken)
-                        }
-                    } catch {
-                        print("🎵 Failed to parse user playlists: \(error.localizedDescription)")
-                        self.searchForWorkingPlaylist(accessToken: accessToken)
-                    }
+                } catch {
+                    print("🎵 Failed to parse user playlists: \(error.localizedDescription)")
+                    strongSelf.searchForWorkingPlaylist(accessToken: accessToken)
                 }
-            }.resume()
+            case .failure(let error):
+                print("🎵 Error getting user playlists: \(error.localizedDescription)")
+                strongSelf.errorMessage = "Failed to get your playlists. Please try reconnecting to Spotify."
+                strongSelf.searchForWorkingPlaylist(accessToken: accessToken)
+            }
         }
     }
     
     private func searchForWorkingPlaylist(accessToken: String) {
         print("🎵 Searching for public workout playlists...")
         
-        // Prevent duplicate requests
-        let requestKey = "search_working_playlist"
-        if pendingRequests.contains(requestKey) {
-            print("🎵 Search working playlist request already in progress")
-            return
-        }
-        pendingRequests.insert(requestKey)
-        
         guard let encodedQuery = "workout fitness".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "https://api.spotify.com/v1/search?q=\(encodedQuery)&type=playlist&limit=10") else {
             self.errorMessage = "Failed to search for playlists. Please try reconnecting to Spotify."
-            pendingRequests.remove(requestKey)
             return
         }
         
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 10.0
-        
-        // Move to background queue
-        backgroundQueue.async {
-            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-                DispatchQueue.main.async {
-                    guard let strongSelf = self else { return }
-                    
-                    strongSelf.pendingRequests.remove(requestKey)
-                    
-                    if let error = error {
-                        print("🎵 Error searching playlists: \(error.localizedDescription)")
-                        self.errorMessage = "Failed to search for playlists. Please try reconnecting to Spotify."
-                        return
+        makeNetworkRequest(
+            url: url,
+            requestType: "search_working_playlist",
+            accessToken: accessToken
+        ) { [weak self] result in
+            guard let strongSelf = self else { return }
+            
+            switch result {
+            case .success(let data):
+                do {
+                    let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
+                    if let firstPlaylist = searchResponse.playlists.items.first {
+                        print("🎵 Found public playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
+                        strongSelf.setCustomPlaylistID(firstPlaylist.id)
+                        strongSelf.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
+                    } else {
+                        strongSelf.errorMessage = "No accessible playlists found. Please create a playlist in Spotify and try again."
                     }
-                    
-                    guard let data = data else {
-                        self.errorMessage = "No search results received. Please try reconnecting to Spotify."
-                        return
-                    }
-                    
-                    do {
-                        let searchResponse = try JSONDecoder().decode(SpotifySearchResponse.self, from: data)
-                        if let firstPlaylist = searchResponse.playlists.items.first {
-                            print("🎵 Found public playlist: \(firstPlaylist.name) (ID: \(firstPlaylist.id))")
-                            self.setCustomPlaylistID(firstPlaylist.id)
-                            self.performPlayback(playlistID: firstPlaylist.id, accessToken: accessToken)
-                        } else {
-                            self.errorMessage = "No accessible playlists found. Please create a playlist in Spotify and try again."
-                        }
-                    } catch {
-                        print("🎵 Failed to parse search results: \(error.localizedDescription)")
-                        self.errorMessage = "Failed to find working playlists. Please try reconnecting to Spotify."
-                    }
+                } catch {
+                    print("🎵 Failed to parse search results: \(error.localizedDescription)")
+                    strongSelf.errorMessage = "Failed to find working playlists. Please try reconnecting to Spotify."
                 }
-            }.resume()
+            case .failure(let error):
+                print("🎵 Error searching playlists: \(error.localizedDescription)")
+                strongSelf.errorMessage = "Failed to search for playlists. Please try reconnecting to Spotify."
+            }
         }
     }
     
@@ -1158,15 +1246,27 @@ class WorkoutMusicManager: NSObject, ObservableObject {
     }
     
     private func setSpotifyVolume(_ volume: Float) {
-        guard let accessToken = spotifyManager.accessToken else { return }
+        guard spotifyManager.accessToken != nil else { return }
         
         // Throttle volume changes to avoid API spam during fade
         let volumePercent = Int(volume * 100)
         
-        // Skip API call if volume change is minimal
-        if abs(volume - (self.volume)) < 0.05 {
+        print("🎵 Setting Spotify volume: \(volume) (\(volumePercent)%)")
+        
+        // Skip API call only if volume change is extremely minimal (less than 1%)
+        if abs(volume - (self.volume)) < 0.01 {
+            print("🎵 Skipping volume change - too small: \(abs(volume - (self.volume)))")
             return
         }
+        
+        setSpotifyVolumeDirectly(volume)
+    }
+    
+    private func setSpotifyVolumeDirectly(_ volume: Float) {
+        guard let accessToken = spotifyManager.accessToken else { return }
+        
+        let volumePercent = Int(volume * 100)
+        print("🎵 Setting Spotify volume directly: \(volume) (\(volumePercent)%)")
         
         guard let url = URL(string: "https://api.spotify.com/v1/me/player/volume?volume_percent=\(volumePercent)") else { return }
         
@@ -1183,6 +1283,8 @@ class WorkoutMusicManager: NSObject, ObservableObject {
                 } else if let httpResponse = response as? HTTPURLResponse {
                     if httpResponse.statusCode != 204 {
                         print("🎵 Volume change failed with status: \(httpResponse.statusCode)")
+                    } else {
+                        print("🎵 Volume change successful: \(volumePercent)%")
                     }
                 }
             }.resume()
@@ -1308,10 +1410,36 @@ struct SpotifyUserPlaylistsResponse: Codable {
     let items: [SpotifyPlaylistInfo]
 }
 
+// MARK: - Network Error Types
+
+enum NetworkError: Error, LocalizedError {
+    case noConnectivity
+    case noData
+    case maxRetriesReached
+    case unknown
+    
+    var errorDescription: String? {
+        switch self {
+        case .noConnectivity:
+            return "No network connectivity"
+        case .noData:
+            return "No data received"
+        case .maxRetriesReached:
+            return "Maximum retry attempts reached"
+        case .unknown:
+            return "Unknown network error"
+        }
+    }
+}
+
 // MARK: - Extensions
+
+// MARK: - WKNavigationDelegate
+
 
 // MARK: - Notifications
 
 extension Notification.Name {
     static let voiceManagerSpeaking = Notification.Name("voiceManagerSpeaking")
 }
+
